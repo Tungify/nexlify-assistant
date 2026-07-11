@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+/* Semantic tokens → Tailwind utilities (bg-bg, text-fg, border-border, …).
+   Light by default; follows the browser/OS in dark. Accent is used sparingly. */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-elevated: var(--elevated);
+  --color-border: var(--border);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+}
+
+:root {
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --elevated: #f4f4f5;
+  --border: #e4e4e7;
+  --fg: #09090b;
+  --muted: #71717a;
+  --accent: #18181b;
+  --accent-fg: #ffffff;
+  --accent-soft: #f4f4f5;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0a0a0a;
+    --surface: #151517;
+    --elevated: #1e1e21;
+    --border: #2a2a2e;
+    --fg: #fafafa;
+    --muted: #8a8a92;
+    --accent: #fafafa;
+    --accent-fg: #0a0a0a;
+    --accent-soft: #232327;
+  }
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  min-width: 320px;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Streamed model output */
+.fb-out {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

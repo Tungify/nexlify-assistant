@@ -1,0 +1,29 @@
+{
+  "name": "nexlify-fb-assistant",
+  "version": "0.2.0",
+  "description": "Personal Chrome side-panel assistant with an agentic local CLI (Claude/ChatGPT) that can read the page DOM.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.app.json"
+  },
+  "dependencies": {
+    "lucide-react": "^1.24.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@crxjs/vite-plugin": "^2.7.1",
+    "@tailwindcss/vite": "^4.3.2",
+    "@types/chrome": "^0.2.2",
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tailwindcss": "^4.3.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  }
+}
