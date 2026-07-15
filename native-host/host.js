@@ -19,6 +19,7 @@ const net = require("net");
 const os = require("os");
 const path = require("path");
 const fs = require("fs");
+const { Readable } = require("stream");
 
 // Load native-host/.env.local (POD_ADMIN_API_URL, POD_ADMIN_ACCESS_KEY, …) so
 // creds live in a git-ignored file, not baked into host.sh. Shell env wins.
@@ -33,6 +34,9 @@ try {
 } catch {}
 
 const SOCK = path.join(os.tmpdir(), `fb-bridge-${process.pid}.sock`);
+// Well-known socket for EXTERNAL clients (a `claude` CLI you run yourself). We
+// listen here too so an outside MCP server can reach the same live extension.
+const PUBLIC_SOCK = require("./bridge-sock");
 const MCP_SERVER = path.join(__dirname, "mcp-server.js");
 
 // Skip the ~1s of non-essential startup work (update check, telemetry, error
@@ -64,7 +68,10 @@ function send(obj) {
 
 // ---- unix socket hub (host <-> mcp-server) -------------------------------
 
-const server = net.createServer((conn) => {
+// One bridge connection (from mcp-server.js, ours or an external one). Tool
+// calls are keyed by a globally-unique callId, so many connections multiplex
+// safely over the same host and route back to the right caller.
+function handleBridgeConn(conn) {
   let acc = "";
   conn.on("data", (d) => {
     acc += d.toString("utf8");
@@ -89,14 +96,56 @@ const server = net.createServer((conn) => {
     for (const [callId, c] of pendingTools) if (c === conn) pendingTools.delete(callId);
   });
   conn.on("error", () => {});
-});
+}
 
+// Private per-session bridge: the CLI this host spawns talks to us here.
+const server = net.createServer(handleBridgeConn);
 try {
   if (fs.existsSync(SOCK)) fs.unlinkSync(SOCK);
   server.listen(SOCK);
 } catch (e) {
   log("socket listen failed:", e.message);
 }
+
+// Public bridge: lets an EXTERNAL Claude Code CLI drive the browser through the
+// same tools. Several hosts can be alive at once (the panel spawns one, the
+// background worker another), so ownership is decided by a live probe rather
+// than last-writer-wins: if something already answers PUBLIC_SOCK we leave it;
+// if it's absent or stale (a dead host's leftover file) we take it over. A
+// periodic re-check means whichever host is still alive reclaims the socket
+// within ~10s after the previous owner (e.g. a closed panel) goes away.
+let publicServer = null;
+function ensurePublicBridge() {
+  const probe = net.connect(PUBLIC_SOCK);
+  const claim = () => {
+    try {
+      fs.mkdirSync(path.dirname(PUBLIC_SOCK), { recursive: true, mode: 0o700 });
+      if (fs.existsSync(PUBLIC_SOCK)) fs.unlinkSync(PUBLIC_SOCK);
+      if (publicServer) publicServer.close();
+      publicServer = net.createServer(handleBridgeConn);
+      publicServer.on("error", (e) => log("public bridge error:", e.message));
+      publicServer.listen(PUBLIC_SOCK, () => log("public bridge listening:", PUBLIC_SOCK));
+    } catch (e) {
+      log("public bridge failed:", e.message);
+    }
+  };
+  probe.on("connect", () => probe.destroy()); // someone's serving it — leave it
+  probe.on("error", claim); // absent or stale — take it over
+}
+ensurePublicBridge();
+const publicReassert = setInterval(ensurePublicBridge, 10000);
+if (publicReassert.unref) publicReassert.unref();
+
+// Heartbeat: when our peer is the background service worker (which runs tools
+// with the panel closed), MV3 idle-suspends it after ~30s. Any inbound message
+// resets that timer, so ping every 20s to keep it — and thus this host and the
+// public socket — alive. The side-panel peer ignores unknown message types.
+const heartbeat = setInterval(() => {
+  try {
+    send({ type: "__ping" });
+  } catch {}
+}, 20000);
+if (heartbeat.unref) heartbeat.unref();
 
 // ==== Provider registry ====================================================
 //
@@ -545,6 +594,415 @@ function pickFolder(msg) {
   });
 }
 
+// ==== Video download (right-click on X / Instagram / Facebook posts) ========
+//
+// Two engines: if `yt-dlp` is on PATH we hand it the post permalink (it picks
+// best video+audio, merges via ffmpeg, and can use the logged-in Chrome cookies)
+// — that's the robust path. Otherwise we fall back to fetching the best direct
+// MP4 URL the extension scraped from the page (works for progressive IG/X video;
+// DASH/HLS-only posts can't be merged without yt-dlp, so we say so).
+
+const DOWNLOAD_DIR = process.env.NEXLIFY_DOWNLOAD_DIR || path.join(os.homedir(), "Downloads");
+const DL_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+// Chrome spawns the native host with a minimal PATH (no /opt/homebrew/bin), so a
+// brew-installed yt-dlp/ffmpeg isn't on it. Prepend the usual bin dirs for any
+// tool we shell out to, and probe absolute paths when locating yt-dlp.
+const TOOL_PATH = [
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  path.join(os.homedir(), ".local/bin"),
+  process.env.PATH || "/usr/bin:/bin",
+].join(":");
+const TOOL_ENV = { ...process.env, PATH: TOOL_PATH };
+
+let _ytdlp; // cache: string path | false | undefined(unknown)
+function findYtDlp() {
+  if (_ytdlp !== undefined) return Promise.resolve(_ytdlp);
+  const candidates = [
+    process.env.YT_DLP_BIN,
+    "/opt/homebrew/bin/yt-dlp",
+    "/usr/local/bin/yt-dlp",
+    path.join(os.homedir(), ".local/bin/yt-dlp"),
+    "yt-dlp", // last: whatever PATH we do have
+  ].filter(Boolean);
+  return new Promise((resolve) => {
+    let i = 0;
+    const tryNext = () => {
+      if (i >= candidates.length) {
+        _ytdlp = false;
+        return resolve(false);
+      }
+      const bin = candidates[i++];
+      execFile(bin, ["--version"], { timeout: 8000, env: TOOL_ENV }, (err) => {
+        if (!err) {
+          _ytdlp = bin;
+          resolve(bin);
+        } else tryNext();
+      });
+    };
+    tryNext();
+  });
+}
+
+function sanitizeName(s) {
+  return (
+    String(s || "")
+      .replace(/[/\\?%*:|"<>\x00-\x1f]/g, "_")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 80) || "video"
+  );
+}
+
+// Pull the post's own id from its URL so files don't collide (IG reels all share
+// the generic title "Instagram", which would otherwise overwrite each other).
+function idFromUrl(u) {
+  try {
+    const p = new URL(u).pathname;
+    const m =
+      p.match(/\/status\/(\d+)/) ||
+      p.match(/\/reels?\/([^/]+)/) ||
+      p.match(/\/p\/([^/]+)/) ||
+      p.match(/\/tv\/([^/]+)/) ||
+      p.match(/\/videos\/(\d+)/) ||
+      p.match(/\/watch\/\?v=(\d+)/);
+    if (m) return m[1];
+  } catch {}
+  return "";
+}
+
+// A unique, non-clobbering path in DOWNLOAD_DIR for the given base name.
+function uniquePath(base) {
+  let out = path.join(DOWNLOAD_DIR, base);
+  if (!fs.existsSync(out)) return out;
+  const ext = path.extname(base);
+  const stem = base.slice(0, base.length - ext.length);
+  for (let i = 2; i < 1000; i++) {
+    out = path.join(DOWNLOAD_DIR, `${stem} (${i})${ext}`);
+    if (!fs.existsSync(out)) return out;
+  }
+  return out;
+}
+
+// yt-dlp path: best video+audio merged to mp4, using the logged-in Chrome
+// cookies. Streams progress lines back; resolves the saved file path.
+function downloadWithYtDlp(bin, msg) {
+  return new Promise((resolve, reject) => {
+    const outTmpl = path.join(DOWNLOAD_DIR, "%(uploader,uploader_id)s-%(title).60B-%(id)s.%(ext)s");
+    const args = [
+      // Grab the best quality available. -S prefers H.264 + AAC only as a
+      // tie-break at EQUAL resolution/fps, so we keep the top resolution (often
+      // VP9/AV1 on IG/FB) yet avoid a needless transcode when a same-res H.264
+      // exists (common on FB/X). Whatever still lands as VP9/AV1 — which Apple
+      // players can't decode — is transcoded to H.264 afterwards (downloadVideo).
+      "-f",
+      "bv*+ba/b",
+      "-S",
+      "res,fps,vcodec:h264,acodec:aac",
+      "--merge-output-format",
+      "mp4",
+      "--no-playlist",
+      "--no-part",
+      "--restrict-filenames",
+      "--newline",
+      "-o",
+      outTmpl,
+      "--cookies-from-browser",
+      "chrome",
+      msg.permalink || msg.pageUrl,
+    ];
+    let finalPath = "";
+    let errTail = "";
+    // TOOL_ENV so yt-dlp finds ffmpeg (needed to merge best video+audio).
+    const child = spawn(bin, args, { env: TOOL_ENV });
+    const onLine = (buf) => {
+      for (const line of buf.toString("utf8").split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        const pct = line.match(/\[download\]\s+([\d.]+)%/);
+        if (pct) send({ type: "download_progress", id: msg.id, pct: parseFloat(pct[1]), line: line.trim() });
+        const dest = line.match(/\[download\] Destination:\s*(.+)$/) || line.match(/Merging formats into "(.+)"$/);
+        if (dest) finalPath = dest[1].trim();
+        const already = line.match(/\[download\]\s+(.+?) has already been downloaded/);
+        if (already) finalPath = already[1].trim();
+      }
+    };
+    child.stdout.on("data", onLine);
+    child.stderr.on("data", (d) => {
+      errTail = (errTail + d.toString("utf8")).slice(-2000);
+    });
+    child.on("error", (e) => reject(e));
+    child.on("close", (code) => {
+      if (code === 0) resolve(finalPath || DOWNLOAD_DIR);
+      else reject(new Error(errTail.trim().split(/\r?\n/).slice(-1)[0] || `yt-dlp exited ${code}`));
+    });
+  });
+}
+
+// IG/FB stream media in byte ranges — the URL we grabbed may carry a mid-file
+// range (bytestart/byteend), which downloads "fine" but is an unplayable fragment.
+// Strip those so we ask for the whole file.
+function stripRange(u) {
+  try {
+    const url = new URL(u);
+    for (const k of ["bytestart", "byteend", "range"]) url.searchParams.delete(k);
+    return url.toString();
+  } catch {
+    return u;
+  }
+}
+
+// A real, standalone MP4 begins with an `ftyp` box (size, then "ftyp" at offset
+// 4). A mid-stream fragment (`moof`/`mdat`/`sidx`/`styp`) or an HTML error page
+// won't — so we can tell a good download from a broken one instead of blindly ✓.
+function looksLikeMp4(head) {
+  if (!head || head.length < 12) return false;
+  const box = head.toString("latin1", 4, 8);
+  return box === "ftyp";
+}
+
+// A fragmented MP4 (DASH representation) has `moof`/`sidx`/`styp` top-level boxes
+// — it's a single-track stream (usually video WITHOUT audio) that QuickTime can't
+// open. Detect it by scanning top-level box headers (seek past mdat, don't read
+// it) so we reject it instead of handing over a file that won't play. IG reels
+// are always this — the honest answer there is yt-dlp (it grabs video+audio and
+// merges them into a normal progressive MP4).
+function isFragmentedMp4(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const size = fs.fstatSync(fd).size;
+    const hdr = Buffer.alloc(16);
+    let off = 0;
+    let sawMoov = false;
+    for (let boxes = 0; off + 8 <= size && boxes < 60; boxes++) {
+      const n = fs.readSync(fd, hdr, 0, 16, off);
+      if (n < 8) break;
+      let boxSize = hdr.readUInt32BE(0);
+      const type = hdr.toString("latin1", 4, 8);
+      if (type === "moof" || type === "sidx" || type === "styp") return true; // fragmented
+      if (type === "moov") sawMoov = true;
+      if (type === "mdat" && sawMoov) return false; // progressive: moov then mdat, no moof
+      if (boxSize === 1) boxSize = Number(hdr.readBigUInt64BE(8)); // 64-bit size
+      if (boxSize < 8) break;
+      off += boxSize;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined)
+      try {
+        fs.closeSync(fd);
+      } catch {}
+  }
+}
+
+// Fallback: fetch a direct MP4 URL (no external tool). Picks the best candidate,
+// skips manifests we can't merge, streams to a file with a browser-like UA +
+// Referer, then verifies it's a real MP4 before reporting success.
+async function downloadDirect(msg) {
+  const cands = [];
+  for (const c of msg.directUrls || []) if (c && c.url) cands.push(c.url);
+  if (msg.srcUrl) cands.push(msg.srcUrl);
+  const isManifest = (u) => /\.(m3u8|mpd)(\?|$)/i.test(u);
+  const picked = cands.find((u) => /^https?:/i.test(u) && !isManifest(u));
+  if (!picked) {
+    const why = cands.some(isManifest)
+      ? "this video is DASH/HLS (streamed in segments) — install yt-dlp to merge it: brew install yt-dlp ffmpeg"
+      : "no direct video URL found on the page — install yt-dlp for full support: brew install yt-dlp ffmpeg";
+    throw new Error(why);
+  }
+  const direct = stripRange(picked);
+  const res = await fetch(direct, {
+    // Range: bytes=0- asks for the WHOLE file from the start (some CDNs only serve
+    // media to range requests). We validate the container below regardless.
+    headers: { "User-Agent": DL_UA, Referer: msg.referer || msg.pageUrl || "", Accept: "*/*", Range: "bytes=0-" },
+  });
+  if ((!res.ok && res.status !== 206) || !res.body) throw new Error(`fetch failed: HTTP ${res.status}`);
+  const id = idFromUrl(msg.permalink) || idFromUrl(msg.pageUrl);
+  const stem = sanitizeName(msg.title) + (id ? "-" + id : "");
+  const outPath = uniquePath(stem + ".mp4");
+  const total = Number(res.headers.get("content-length")) || 0;
+  let got = 0;
+  let lastPct = -1;
+  let head = Buffer.alloc(0);
+  const ws = fs.createWriteStream(outPath);
+  const nodeStream = Readable.fromWeb(res.body);
+  nodeStream.on("data", (chunk) => {
+    if (head.length < 16) head = Buffer.concat([head, chunk.subarray(0, 16 - head.length)]);
+    got += chunk.length;
+    if (total) {
+      const pct = Math.floor((got / total) * 100);
+      if (pct !== lastPct) {
+        lastPct = pct;
+        send({ type: "download_progress", id: msg.id, pct });
+      }
+    }
+  });
+  await new Promise((resolve, reject) => {
+    nodeStream.pipe(ws);
+    ws.on("finish", resolve);
+    ws.on("error", reject);
+    nodeStream.on("error", reject);
+  });
+  // Reject a fragment / error page saved as .mp4, or a fragmented (DASH) MP4 that
+  // won't play / has no audio — so the user isn't handed a broken file with a ✓.
+  // Both are the common IG-reel case; the honest fix is yt-dlp.
+  const bad =
+    !looksLikeMp4(head)
+      ? "only got a partial stream, not a full video"
+      : isFragmentedMp4(outPath)
+        ? "this is a fragmented DASH stream (video only, won't play in QuickTime)"
+        : "";
+  if (bad) {
+    try {
+      fs.unlinkSync(outPath);
+    } catch {}
+    throw new Error(`${bad} — Instagram reels need yt-dlp: brew install yt-dlp ffmpeg`);
+  }
+  return outPath;
+}
+
+// ---- H.264 transcode (Apple-player compatibility) ------------------------
+//
+// QuickTime / Preview / Photos can't decode VP9 or AV1. IG (and some FB) serve
+// their top resolution only in those codecs, so a "best quality" download can
+// open black in Apple players even though the file is fine (VLC plays it). We
+// keep the full resolution and re-encode the video to H.264 (audio to AAC) so
+// it plays everywhere. H.264 downloads are left untouched — no needless re-encode.
+
+const APPLE_INCOMPATIBLE_VCODEC = /^(vp0?8|vp0?9|av0?1)/i; // vp8/vp9/av1 (yt-dlp: vp09/av01)
+
+// codec of the first video stream + container duration (for transcode progress).
+function probeVideo(filePath) {
+  return new Promise((resolve) => {
+    execFile(
+      "ffprobe",
+      ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name:format=duration", "-of", "json", filePath],
+      { timeout: 15000, env: TOOL_ENV },
+      (err, stdout) => {
+        if (err) return resolve({ vcodec: "", duration: 0 });
+        try {
+          const j = JSON.parse(stdout);
+          const vcodec = String((j.streams && j.streams[0] && j.streams[0].codec_name) || "").toLowerCase();
+          resolve({ vcodec, duration: parseFloat(j.format && j.format.duration) || 0 });
+        } catch {
+          resolve({ vcodec: "", duration: 0 });
+        }
+      },
+    );
+  });
+}
+
+// Re-encode video to H.264 (libx264, crf 18 ≈ visually lossless, veryfast so a
+// short reel finishes in a couple of seconds), audio to AAC, faststart for quick
+// open. Writes a sibling temp then renames over the original so the filename the
+// user sees is unchanged. Streams progress via ffmpeg's -progress pipe.
+function transcodeToH264(inPath, durationSec, msg) {
+  return new Promise((resolve, reject) => {
+    const tmp = inPath.replace(/\.[^.]+$/, "") + ".h264.mp4";
+    const args = [
+      "-y",
+      "-nostdin",
+      "-i",
+      inPath,
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "18",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "160k",
+      "-movflags",
+      "+faststart",
+      "-progress",
+      "pipe:1",
+      "-v",
+      "error",
+      tmp,
+    ];
+    const child = spawn("ffmpeg", args, { env: TOOL_ENV });
+    let errTail = "";
+    let acc = "";
+    child.stdout.on("data", (d) => {
+      acc += d.toString("utf8");
+      let nl;
+      while ((nl = acc.indexOf("\n")) >= 0) {
+        const line = acc.slice(0, nl);
+        acc = acc.slice(nl + 1);
+        const m = line.match(/^out_time=(\d+):(\d+):([\d.]+)/);
+        if (m && durationSec > 0) {
+          const sec = Number(m[1]) * 3600 + Number(m[2]) * 60 + parseFloat(m[3]);
+          const pct = Math.max(0, Math.min(99, Math.round((sec / durationSec) * 100)));
+          send({ type: "download_progress", id: msg.id, pct, line: `Converting to H.264… ${pct}%` });
+        }
+      }
+    });
+    child.stderr.on("data", (d) => {
+      errTail = (errTail + d.toString("utf8")).slice(-2000);
+    });
+    child.on("error", (e) => reject(e));
+    child.on("close", (code) => {
+      if (code === 0) {
+        try {
+          fs.renameSync(tmp, inPath);
+        } catch (e) {
+          return reject(e);
+        }
+        resolve(inPath);
+      } else {
+        try {
+          fs.unlinkSync(tmp);
+        } catch {}
+        reject(new Error(errTail.trim().split(/\r?\n/).slice(-1)[0] || `ffmpeg exited ${code}`));
+      }
+    });
+  });
+}
+
+async function downloadVideo(msg) {
+  try {
+    fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+    const bin = await findYtDlp();
+    let outPath;
+    let engine;
+    if (bin) {
+      engine = "yt-dlp";
+      outPath = await downloadWithYtDlp(bin, msg);
+    } else {
+      engine = "direct";
+      outPath = await downloadDirect(msg);
+    }
+
+    // Make VP9/AV1 downloads playable in Apple players without losing resolution.
+    // Non-fatal: if the transcode fails we keep the original (still plays in VLC)
+    // rather than throwing away a good download.
+    try {
+      if (outPath && /\.(mp4|mkv|webm|mov|m4v)$/i.test(outPath) && fs.existsSync(outPath)) {
+        const { vcodec, duration } = await probeVideo(outPath);
+        if (APPLE_INCOMPATIBLE_VCODEC.test(vcodec)) {
+          send({ type: "download_progress", id: msg.id, line: `Converting ${vcodec.toUpperCase()} → H.264 (keeping resolution)…` });
+          outPath = await transcodeToH264(outPath, duration, msg);
+          engine += " → H.264";
+        }
+      }
+    } catch (e) {
+      log("transcode failed, keeping original:", (e && e.message) || e);
+    }
+
+    send({ type: "download_result", id: msg.id, ok: true, path: outPath, engine });
+  } catch (e) {
+    send({ type: "download_result", id: msg.id, ok: false, error: String((e && e.message) || e) });
+  }
+}
+
 function handle(msg) {
   if (msg.type === "cancel") cancel(msg.id);
   else if (msg.type === "tool_result") toolResult(msg);
@@ -552,6 +1010,7 @@ function handle(msg) {
   else if (msg.type === "reset") reset(msg);
   else if (msg.type === "shop_summary") shopSummary(msg);
   else if (msg.type === "pick_folder") pickFolder(msg);
+  else if (msg.type === "download_video") downloadVideo(msg);
   else run(msg);
 }
 
@@ -583,6 +1042,9 @@ process.stdin.on("end", () => {
   try {
     server.close();
     if (fs.existsSync(SOCK)) fs.unlinkSync(SOCK);
+    // Leave PUBLIC_SOCK's file in place — a newer host may now own that path;
+    // the next startup clears a truly-stale one.
+    if (publicServer) publicServer.close();
   } catch {}
   process.exit(0);
 });

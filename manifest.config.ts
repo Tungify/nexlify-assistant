@@ -18,8 +18,46 @@ export default defineManifest({
   // "debugger" powers the console/network capture (CDP), gated behind the
   // "Capture console & network" setting (off by default) since attaching shows
   // Chrome's "being debugged" banner. "storage" persists conversation history.
-  permissions: ["sidePanel", "nativeMessaging", "scripting", "tabs", "debugger", "storage"],
+  // "alarms" keeps the background service worker's native-host connection alive
+  // (and reconnects it) so the browser tools work with the side panel closed.
+  // "contextMenus" adds the right-click "Download video" entry on social posts;
+  // "notifications" reports download progress/result without needing the panel.
+  permissions: [
+    "sidePanel",
+    "nativeMessaging",
+    "scripting",
+    "tabs",
+    "debugger",
+    "storage",
+    "alarms",
+    "contextMenus",
+    "notifications",
+  ],
   host_permissions: ["<all_urls>"],
   background: { service_worker: "src/background.ts", type: "module" },
   side_panel: { default_path: "src/sidepanel/index.html" },
+  // Passive coordinate tracker so "Download video" can target the exact video the
+  // user pointed at (through overlays, in a multi-video feed). See videoPick.ts.
+  content_scripts: [
+    {
+      matches: [
+        "*://*.x.com/*",
+        "*://*.twitter.com/*",
+        "*://*.instagram.com/*",
+        "*://*.facebook.com/*",
+        "*://*.fb.watch/*",
+      ],
+      js: ["src/content/videoPick.ts"],
+      run_at: "document_start",
+      all_frames: true,
+    },
+  ],
+  // Page-proof trigger: works even when a site overlays the video or hijacks the
+  // right-click menu (e.g. Facebook). Rebindable at chrome://extensions/shortcuts.
+  commands: {
+    "download-video": {
+      suggested_key: { default: "Ctrl+Shift+Y", mac: "Command+Shift+Y" },
+      description: "Download the video under the cursor (X / Instagram / Facebook)",
+    },
+  },
 });

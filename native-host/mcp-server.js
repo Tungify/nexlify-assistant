@@ -7,7 +7,11 @@
 
 const net = require("net");
 
-const SOCK = process.env.FB_BRIDGE_SOCK;
+// When host.js spawns us it sets FB_BRIDGE_SOCK to its private per-session
+// socket. Run standalone (e.g. added to an external Claude Code CLI) with
+// neither set and we fall back to the well-known public bridge socket that
+// host.js also listens on — so an outside CLI reaches the live extension.
+const SOCK = process.env.FB_BRIDGE_SOCK || require("./bridge-sock");
 const PROTOCOL = "2024-11-05";
 
 // Full catalog. The host narrows it per session via FB_TOOLS (see ACTIVE_TOOLS)
@@ -318,7 +322,9 @@ function callTool(tool, args) {
     try {
       s = await ensureSock();
     } catch (e) {
-      return reject(new Error("browser bridge not connected: " + e.message));
+      return reject(
+        new Error("browser bridge not connected (open the Nexlify Assistant side panel in Chrome): " + e.message),
+      );
     }
     const callId = `${prefix}-${++counter}`;
     const timer = setTimeout(() => {
