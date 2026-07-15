@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  AppWindow,
   ArrowUp,
   Bug,
   Building2,
@@ -117,6 +118,9 @@ export default function App() {
   const [model, setModel] = useState("sonnet");
   const [effort, setEffort] = useState("medium");
   const [pageOn, setPageOn] = useState(true); // read + control the live tab
+  // Let the assistant manage tabs (open/close/switch/navigate). On by default —
+  // the same agentic, no-friction stance as page control.
+  const [tabsOn, setTabsOn] = useState(() => localStorage.getItem("fb_tabs_on") !== "0");
   // Permission for the assistant to capture console/network. On by default; the
   // debugger only actually attaches (and shows Chrome's banner) when the AI
   // first uses it, so "on" is banner-free until then.
@@ -131,6 +135,7 @@ export default function App() {
   useEffect(() => void localStorage.setItem("pod_api_url", apiUrl), [apiUrl]);
   useEffect(() => void localStorage.setItem("pod_access_key", accessKey), [accessKey]);
   useEffect(() => void localStorage.setItem("fb_capture_on", captureOn ? "1" : "0"), [captureOn]);
+  useEffect(() => void localStorage.setItem("fb_tabs_on", tabsOn ? "1" : "0"), [tabsOn]);
   useEffect(() => void localStorage.setItem("fb_repo_path", repoPath), [repoPath]);
 
   // conversation
@@ -175,6 +180,7 @@ export default function App() {
   const buildCfg = () => ({
     cli,
     page: pageOn,
+    tabs: tabsOn,
     capture: captureOn,
     repoPath: repoPath.trim(),
     model,
@@ -317,8 +323,8 @@ export default function App() {
   // Keep a prewarmed session matching the current settings so the first turn of
   // the next conversation only waits on the API, not cold-start.
   useEffect(() => {
-    bridgeRef.current?.prewarm({ cli, page: pageOn, capture: captureOn, repoPath: repoPath.trim(), model, effort });
-  }, [cli, pageOn, captureOn, repoPath, model, effort]);
+    bridgeRef.current?.prewarm({ cli, page: pageOn, tabs: tabsOn, capture: captureOn, repoPath: repoPath.trim(), model, effort });
+  }, [cli, pageOn, tabsOn, captureOn, repoPath, model, effort]);
 
   // Capture is "AI decides": the CDP debugger attaches on-demand when the
   // assistant first reads console/network (see bridge.runTool), not from this
@@ -632,6 +638,16 @@ export default function App() {
                     <input
                       type="checkbox"
                       className="h-4 w-4 accent-accent"
+                      checked={tabsOn}
+                      onChange={(e) => setTabsOn(e.target.checked)}
+                    />
+                    <AppWindow className="h-4 w-4 text-muted" />
+                    Control browser tabs
+                  </label>
+                  <label className="mt-2 flex cursor-pointer items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 accent-accent"
                       checked={captureOn}
                       onChange={(e) => setCaptureOn(e.target.checked)}
                     />
@@ -734,8 +750,8 @@ export default function App() {
             <Sparkles className="h-7 w-7 opacity-60" />
             <p className="text-sm">Ask anything, or tell me what to do on this tab.</p>
             <p className="text-xs">
-              I can read &amp; control the page, debug its console/network, and read your repo. On a Featurebase ticket,
-              use “Draft reply” on the merchant card.
+              I can read &amp; control the page, open/switch/close tabs, debug its console/network, and read your repo. On
+              a Featurebase ticket, use “Draft reply” on the merchant card.
             </p>
           </div>
         ) : (

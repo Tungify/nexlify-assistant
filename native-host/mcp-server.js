@@ -159,6 +159,104 @@ const TOOLS = [
       required: ["id"],
     },
   },
+  // ---- browser / tab control ----------------------------------------------
+  // Manage tabs and navigation for the whole window (not the page DOM). The page
+  // tools (get_page/query_dom/click/…) and the console/network capture always
+  // act on the ACTIVE tab, so open_tab / switch_tab change what they read next.
+  {
+    name: "list_tabs",
+    description:
+      "List the browser's open tabs — { id, url, title, active, windowId, status, index }. Use it to find a tab's id before switch_tab / close_tab / navigate, or to see what the user has open. Defaults to the current window.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        allWindows: { type: "boolean", description: "Include tabs from every window, not just the current one (default false)." },
+      },
+    },
+  },
+  {
+    name: "open_tab",
+    description:
+      "Open a new browser tab, optionally at a URL, and (by default) make it active so the page/debug tools act on it next. Waits for the page to finish loading before returning.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "URL to open — include the scheme, e.g. https://example.com. Omit for a blank tab." },
+        active: { type: "boolean", description: "Focus the new tab (default true); false opens it in the background." },
+        waitForLoad: { type: "boolean", description: "Wait until the tab finishes loading before returning (default true)." },
+      },
+    },
+  },
+  {
+    name: "close_tab",
+    description:
+      "Close a tab by id (from list_tabs). If no id is given, closes the ACTIVE tab. Use with care — this closes the user's tab.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number", description: "Id of the tab to close (default: the active tab)." },
+      },
+    },
+  },
+  {
+    name: "switch_tab",
+    description:
+      "Make a tab active (and focus its window). Afterwards get_page / query_dom / click / console / network all act on that tab. Get the id from list_tabs.",
+    inputSchema: {
+      type: "object",
+      properties: { tabId: { type: "number", description: "Id of the tab to activate." } },
+      required: ["tabId"],
+    },
+  },
+  {
+    name: "navigate",
+    description:
+      "Navigate a tab to a URL (defaults to the active tab). Waits for the load to finish so you can read the new page immediately after. Use this to go straight to a URL instead of clicking a link.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "Destination URL — include the scheme (https://…)." },
+        tabId: { type: "number", description: "Tab to navigate (default: the active tab)." },
+        waitForLoad: { type: "boolean", description: "Wait until loading finishes before returning (default true)." },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "reload_tab",
+    description:
+      "Reload a tab (defaults to the active tab). Handy to re-trigger requests / console output while capture is on.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number", description: "Tab to reload (default: the active tab)." },
+        bypassCache: { type: "boolean", description: "Hard reload, ignoring the cache (default false)." },
+        waitForLoad: { type: "boolean", description: "Wait until loading finishes before returning (default true)." },
+      },
+    },
+  },
+  {
+    name: "go_back",
+    description: "Go back one entry in a tab's history (defaults to the active tab).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number", description: "Tab (default: the active tab)." },
+        waitForLoad: { type: "boolean", description: "Wait until loading finishes before returning (default true)." },
+      },
+    },
+  },
+  {
+    name: "go_forward",
+    description: "Go forward one entry in a tab's history (defaults to the active tab).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number", description: "Tab (default: the active tab)." },
+        waitForLoad: { type: "boolean", description: "Wait until loading finishes before returning (default true)." },
+      },
+    },
+  },
 ];
 
 // The host sets FB_TOOLS to the comma-separated names it enabled for this

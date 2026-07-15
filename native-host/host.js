@@ -110,9 +110,11 @@ try {
 // already gated by supportsTools.
 
 // Browser tools exposed over the fbbridge MCP. PAGE = read + control the live
-// tab; DEBUG = read the console/network capture buffer. The panel gates each
-// group with a setting; we advertise only the enabled ones (FB_TOOLS).
+// tab; TAB = open/close/switch/navigate tabs for the whole window; DEBUG = read
+// the console/network capture buffer. The panel gates each group with a setting;
+// we advertise only the enabled ones (FB_TOOLS).
 const PAGE_TOOLS = ["get_page", "query_dom", "screenshot", "click", "type_text", "press_key", "scroll_to", "wait_for"];
+const TAB_TOOLS = ["list_tabs", "open_tab", "close_tab", "switch_tab", "navigate", "reload_tab", "go_back", "go_forward"];
 const DEBUG_TOOLS = ["get_console_logs", "get_network_requests", "get_network_request"];
 // Built-in Claude tools allowed only when a local repo path is set (read-only).
 const REPO_TOOLS = ["Read", "Grep", "Glob"];
@@ -150,6 +152,7 @@ function sessionCfg(msg) {
   const canTools = !!(provider && provider.supportsTools);
   return {
     page: canTools && !!msg.page,
+    tabs: canTools && !!msg.tabs,
     capture: canTools && !!msg.capture,
     repoPath: validRepo(msg.repoPath),
     model: msg.model || "",
@@ -162,7 +165,7 @@ const PROVIDERS = {
     cmd: process.env.CLAUDE_BIN || "claude",
     format: "claude-stream-json",
     supportsTools: true,
-    buildArgs({ page, capture, repoPath, model, effort }) {
+    buildArgs({ page, tabs, capture, repoPath, model, effort }) {
       const a = [
         "-p",
         "--input-format",
@@ -179,6 +182,7 @@ const PROVIDERS = {
       if (effort) a.push("--effort", effort);
       const bridgeTools = [];
       if (page) bridgeTools.push(...PAGE_TOOLS);
+      if (tabs) bridgeTools.push(...TAB_TOOLS);
       if (capture) bridgeTools.push(...DEBUG_TOOLS);
       const allowed = bridgeTools.map((n) => "mcp__fbbridge__" + n);
       if (repoPath) allowed.push(...REPO_TOOLS); // cwd is set to the repo in spawnSession
@@ -237,7 +241,7 @@ function emitStreamLine(id, line) {
 // effort, and whether the DOM tools (and thus MCP) are wired in.
 function cfgKey(msg) {
   const c = sessionCfg(msg);
-  return JSON.stringify({ cli: msg.cli, page: c.page, capture: c.capture, repoPath: c.repoPath, model: c.model, effort: c.effort });
+  return JSON.stringify({ cli: msg.cli, page: c.page, tabs: c.tabs, capture: c.capture, repoPath: c.repoPath, model: c.model, effort: c.effort });
 }
 
 // Spawn an idle stream-json session for this config. The user turn arrives
