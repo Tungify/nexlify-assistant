@@ -1,12 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  ArrowUp,
+  Bug,
   Building2,
   CalendarClock,
   Check,
   ChevronDown,
   Copy,
   CornerDownLeft,
+  FolderGit2,
   Globe,
+  Headset,
+  History,
   Layers,
   LoaderCircle,
   Palette,
@@ -14,11 +19,26 @@ import {
   RefreshCw,
   Settings2,
   ShoppingBag,
+  Sparkles,
   Square,
   Store,
+  Trash2,
 } from "lucide-react";
-import { Bridge, readShopDomain, type Cli, type HostEvent, type ShopSummary } from "./bridge";
-import { TOOL } from "./tools";
+import { Bridge, isFeaturebasePage, readShopDomain, type Cli, type HostEvent, type ShopSummary } from "./bridge";
+import { type CaptureStatus } from "./capture";
+import { APP_NAME, DRAFT_REPLY_INSTRUCTION, GENERAL_PREAMBLE } from "./tools";
+import {
+  clearConversations,
+  deleteConversation,
+  deriveTitle,
+  loadConversations,
+  newConversationId,
+  saveConversation,
+  type Conversation,
+} from "./history";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
 
 const MODELS = [
   { label: "Sonnet", value: "sonnet" },
@@ -52,24 +72,66 @@ function cx(...c: (string | false | null | undefined)[]) {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-export default function App() {
-  const tool = TOOL;
-  const Icon = tool.icon;
+function relTime(ts: number): string {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `${d}d ago`;
+  return new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
 
+// Resuming a saved conversation: the native CLI session is gone, so we seed the
+// fresh session's first turn with the whole transcript as context.
+function buildReplayPrompt(history: Msg[], newText: string): string {
+  const transcript = history
+    .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`)
+    .join("\n\n");
+  return (
+    GENERAL_PREAMBLE +
+    "\n\nYou are resuming an earlier conversation. Transcript so far:\n\n" +
+    transcript +
+    "\n\n---\nContinue the conversation. The user now says:\n" +
+    (newText || "(continue)")
+  );
+}
+
+// Assistant output as rendered markdown — proportional prose, fenced code as
+// highlighted code blocks (js → js, text → text). Handles partial markdown
+// gracefully while streaming.
+function AssistantText({ text }: { text: string }) {
+  return (
+    <div className="md">
+      <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+        {text}
+      </Markdown>
+    </div>
+  );
+}
+
+export default function App() {
   // settings — apply to the NEXT conversation (a live one keeps its config)
   const [model, setModel] = useState("sonnet");
   const [effort, setEffort] = useState("medium");
-  const [readPageOn, setReadPageOn] = useState(true);
+  const [pageOn, setPageOn] = useState(true); // read + control the live tab
+  // Permission for the assistant to capture console/network. On by default; the
+  // debugger only actually attaches (and shows Chrome's banner) when the AI
+  // first uses it, so "on" is banner-free until then.
+  const [captureOn, setCaptureOn] = useState(() => localStorage.getItem("fb_capture_on") !== "0");
+  const [repoPath, setRepoPath] = useState(() => localStorage.getItem("fb_repo_path") ?? "");
+  const [browsing, setBrowsing] = useState(false); // folder picker in flight
+  const [captureStatus, setCaptureStatus] = useState<CaptureStatus | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // Merchant-summary API URL + access key (override the host's env); persisted.
   const [apiUrl, setApiUrl] = useState(() => localStorage.getItem("pod_api_url") ?? "");
   const [accessKey, setAccessKey] = useState(() => localStorage.getItem("pod_access_key") ?? "");
-  useEffect(() => {
-    localStorage.setItem("pod_api_url", apiUrl);
-  }, [apiUrl]);
-  useEffect(() => {
-    localStorage.setItem("pod_access_key", accessKey);
-  }, [accessKey]);
+  useEffect(() => void localStorage.setItem("pod_api_url", apiUrl), [apiUrl]);
+  useEffect(() => void localStorage.setItem("pod_access_key", accessKey), [accessKey]);
+  useEffect(() => void localStorage.setItem("fb_capture_on", captureOn ? "1" : "0"), [captureOn]);
+  useEffect(() => void localStorage.setItem("fb_repo_path", repoPath), [repoPath]);
 
   // conversation
   const [messages, setMessages] = useState<Msg[]>([]);
@@ -78,25 +140,73 @@ export default function App() {
   const [status, setStatus] = useState<{ label: string; tone: Tone }>({ label: "ready", tone: "idle" });
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
 
-  // merchant summary card (auto-loaded from the open ticket)
+  // history
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyList, setHistoryList] = useState<Conversation[]>([]);
+
+  // merchant summary card — contextual: only shown when a shop is detected on
+  // the current page (Featurebase ticket), hidden on ordinary pages.
   const [summary, setSummary] = useState<ShopSummary | null>(null);
-  const [summaryState, setSummaryState] = useState<"loading" | "idle" | "empty" | "error">("loading");
+  const [summaryState, setSummaryState] = useState<"loading" | "idle" | "error">("loading");
   const [summaryErr, setSummaryErr] = useState<string | undefined>();
+  const [shopDetected, setShopDetected] = useState(false);
 
   const bridgeRef = useRef<Bridge | null>(null);
   const reqIdRef = useRef(0);
   const activeRef = useRef<number | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
-  // The shop currently shown on the card, so auto-triggers can tell whether the
-  // open ticket actually switched merchants. pollGenRef cancels a stale poll
-  // loop; reloadRef lets the once-registered tab listeners call the latest
-  // closure (which captures the current apiUrl/accessKey).
+  // Streaming smoothing: incoming (chunky) deltas buffer here and a rAF loop
+  // reveals them a slice at a time so it reads as realtime typing.
+  const pendingRef = useRef("");
+  const rafRef = useRef<number | null>(null);
   const loadedDomainRef = useRef<string>("");
   const pollGenRef = useRef(0);
   const reloadRef = useRef<() => Promise<void>>();
+  const stopRef = useRef<() => void>(); // latest stop(), for the Esc-to-take-over handler
+  // Conversation bookkeeping. messagesRef mirrors messages for stale-free saves;
+  // convIdRef is the id we persist under; replayPendingRef marks a reopened
+  // conversation whose next turn must re-seed the transcript as context.
+  const messagesRef = useRef<Msg[]>([]);
+  messagesRef.current = messages;
+  const convIdRef = useRef<string | null>(null);
+  const replayPendingRef = useRef(false);
   const cli: Cli = "claude";
 
-  // Append streamed text to the in-flight assistant message (the last one).
+  const buildCfg = () => ({
+    cli,
+    page: pageOn,
+    capture: captureOn,
+    repoPath: repoPath.trim(),
+    model,
+    effort,
+  });
+
+  // Pop the OS folder picker (via the native host) and fill in the repo path.
+  const browseRepo = async () => {
+    if (browsing) return;
+    setBrowsing(true);
+    try {
+      const r = await bridgeRef.current?.pickFolder();
+      if (r?.path) setRepoPath(r.path);
+    } finally {
+      setBrowsing(false);
+    }
+  };
+
+  // Persist the current conversation (upsert by id). No-op when empty.
+  const saveCurrent = () => {
+    const msgs = messagesRef.current;
+    if (!msgs.length) return;
+    if (!convIdRef.current) convIdRef.current = newConversationId();
+    void saveConversation({
+      id: convIdRef.current,
+      title: deriveTitle(msgs),
+      updatedAt: Date.now(),
+      messages: msgs.map((m) => ({ role: m.role, text: m.text })),
+    });
+  };
+
+  // Append text to the in-flight assistant message (the last one).
   const appendToLast = (delta: string) =>
     setMessages((ms) => {
       if (!ms.length || ms[ms.length - 1].role !== "assistant") return ms;
@@ -104,6 +214,43 @@ export default function App() {
       next[next.length - 1] = { role: "assistant", text: next[next.length - 1].text + delta };
       return next;
     });
+
+  // Drain the buffer a slice per frame; the slice scales with how much is
+  // waiting, so it catches up under fast bursts but still animates.
+  const pump = () => {
+    const pending = pendingRef.current;
+    if (!pending) {
+      rafRef.current = null;
+      return;
+    }
+    const step = Math.max(2, Math.ceil(pending.length / 5));
+    appendToLast(pending.slice(0, step));
+    pendingRef.current = pending.slice(step);
+    rafRef.current = requestAnimationFrame(pump);
+  };
+  const enqueue = (delta: string) => {
+    pendingRef.current += delta;
+    if (rafRef.current == null) rafRef.current = requestAnimationFrame(pump);
+  };
+  // Reveal whatever's left immediately (turn ended / interrupted).
+  const flushStream = () => {
+    if (rafRef.current != null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    if (pendingRef.current) {
+      appendToLast(pendingRef.current);
+      pendingRef.current = "";
+    }
+  };
+  // Drop any buffered text without showing it (starting a different turn).
+  const resetStream = () => {
+    if (rafRef.current != null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    pendingRef.current = "";
+  };
 
   useEffect(() => {
     const finish = (label: string, tone: Tone) => {
@@ -117,22 +264,29 @@ export default function App() {
       }
       switch (e.type) {
         case "chunk":
-          appendToLast(e.data);
+          enqueue(e.data);
           break;
         case "tool_use":
           setStatus({ label: `→ ${e.name}`, tone: "info" });
           break;
+        case "thinking":
+          setStatus({ label: "thinking…", tone: "info" });
+          break;
         case "stderr":
+          flushStream();
           appendToLast(`\n\n⚠️ ${e.data}`);
           break;
         case "error":
+          flushStream();
           appendToLast(`\n\n⚠️ ${e.error}`);
           finish("error", "critical");
           break;
         case "done":
+          flushStream();
           finish(e.code === 0 ? "done" : `exit ${e.code}`, e.code === 0 ? "success" : "critical");
           break;
         case "disconnected":
+          flushStream();
           appendToLast(
             `\n\n⚠️ native host not reachable. Run ./install.sh <extension-id> and restart Chrome.\n${e.error ?? ""}`,
           );
@@ -140,32 +294,54 @@ export default function App() {
           break;
       }
     };
-    const b = new Bridge(onEvent);
+    // Just mirror the capture status. Dismissing the debugger banner detaches
+    // the CDP session, but we no longer revoke the permission — the assistant
+    // re-attaches on-demand the next time it reads console/network.
+    const b = new Bridge(onEvent, (s) => setCaptureStatus(s));
     b.connect();
     bridgeRef.current = b;
-    return () => b.disconnect();
+    return () => {
+      saveCurrent();
+      b.disconnect();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Autosave to history whenever a turn finishes (running → false with content).
+  useEffect(() => {
+    if (running || !messagesRef.current.length) return;
+    saveCurrent();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running]);
 
   // Keep a prewarmed session matching the current settings so the first turn of
   // the next conversation only waits on the API, not cold-start.
   useEffect(() => {
-    bridgeRef.current?.prewarm({ cli, tools: readPageOn && tool.usesTools, model, effort });
-  }, [cli, readPageOn, tool.usesTools, model, effort]);
+    bridgeRef.current?.prewarm({ cli, page: pageOn, capture: captureOn, repoPath: repoPath.trim(), model, effort });
+  }, [cli, pageOn, captureOn, repoPath, model, effort]);
+
+  // Capture is "AI decides": the CDP debugger attaches on-demand when the
+  // assistant first reads console/network (see bridge.runTool), not from this
+  // toggle. The toggle is only a permission — turning it off detaches at once.
+  useEffect(() => {
+    const b = bridgeRef.current;
+    if (!b) return;
+    if (!captureOn) void b.capture.disable();
+  }, [captureOn]);
 
   // Auto-scroll to the newest content.
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "end" });
   }, [messages]);
 
-  // Fetch + render the summary for a specific shop domain (empty → show the
-  // "no shop" state). Records the domain so auto-triggers can dedupe.
+  // Fetch + render the summary for a shop domain. Empty domain → hide the card.
   const applySummary = async (domain: string) => {
+    setShopDetected(!!domain);
     setSummaryState("loading");
     setSummaryErr(undefined);
     if (!domain) {
       loadedDomainRef.current = "";
       setSummary(null);
-      setSummaryState("empty");
       return;
     }
     const r = await bridgeRef.current?.shopSummary(
@@ -184,28 +360,34 @@ export default function App() {
     }
   };
 
-  // Manual/forced load (first open, New chat, ↻): re-detect and reload no
-  // matter what.
+  // Manual/forced load (first open, ↻): re-detect and reload no matter what.
   const loadSummary = async () => {
     await applySummary(await readShopDomain());
   };
 
-  // Auto path. Featurebase is an SPA: switching conversations swaps the ticket
-  // in place — no page reload — and the new shop's details render a beat later.
-  // So on a navigation signal we poll the domain a few times and reload only
-  // once a *different* shop appears; a newer signal supersedes an in-flight
-  // poll so triggers don't stack.
+  // Auto path. Featurebase is an SPA: switching tickets swaps the shop in place.
+  // Poll a few times; reload on a *different* shop, and hide the card once we're
+  // confident there's no shop on the page (ordinary tab). A newer signal
+  // supersedes an in-flight poll so triggers don't stack.
   const reloadIfShopChanged = async () => {
     const gen = ++pollGenRef.current;
+    // Off Featurebase there's never a shop — hide the card at once instead of
+    // polling readShopDomain for 3s waiting for an SPA that isn't there.
+    if (!(await isFeaturebasePage())) {
+      if (gen === pollGenRef.current && loadedDomainRef.current) await applySummary("");
+      return;
+    }
     for (let i = 0; i < 6; i++) {
       if (gen !== pollGenRef.current) return; // a newer signal took over
       const domain = await readShopDomain();
-      if (domain && domain !== loadedDomainRef.current) {
-        await applySummary(domain);
+      if (domain) {
+        if (domain !== loadedDomainRef.current) await applySummary(domain);
         return;
       }
       await sleep(500);
     }
+    // No shop domain after ~3s → hide the card if one was showing.
+    if (gen === pollGenRef.current && loadedDomainRef.current) await applySummary("");
   };
   reloadRef.current = reloadIfShopChanged;
 
@@ -215,40 +397,57 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Re-detect the merchant whenever the open ticket may have changed: an SPA
-  // URL change or full load in the active tab, switching browser tabs, or
-  // refocusing the window. Registered once; always runs the latest closure via
-  // reloadRef so it sees the current API URL / access key.
+  // Re-detect the merchant + follow the active tab (for capture) whenever the
+  // open tab may have changed: SPA URL change / full load, tab switch, refocus.
   useEffect(() => {
-    const trigger = () => void reloadRef.current?.();
-    const onUpdated: Parameters<typeof chrome.tabs.onUpdated.addListener>[0] = (
-      _tabId,
-      changeInfo,
-      tab,
-    ) => {
+    const trigger = () => {
+      void reloadRef.current?.();
+      void bridgeRef.current?.capture.attachToActive();
+    };
+    const onUpdated: Parameters<typeof chrome.tabs.onUpdated.addListener>[0] = (_tabId, changeInfo, tab) => {
       if (tab.active && (changeInfo.url || changeInfo.status === "complete")) trigger();
     };
     chrome.tabs.onUpdated.addListener(onUpdated);
     chrome.tabs.onActivated.addListener(trigger);
     window.addEventListener("focus", trigger);
+    // The driving overlay posts this from the page when the user hits Esc to
+    // take over — interrupt the turn so the AI stops acting on the tab.
+    const onMsg = (msg: unknown) => {
+      if (msg && typeof msg === "object" && (msg as { __nexlifyDrive?: string }).__nexlifyDrive === "stop") {
+        stopRef.current?.();
+      }
+    };
+    chrome.runtime.onMessage.addListener(onMsg);
     return () => {
       chrome.tabs.onUpdated.removeListener(onUpdated);
       chrome.tabs.onActivated.removeListener(trigger);
       window.removeEventListener("focus", trigger);
+      chrome.runtime.onMessage.removeListener(onMsg);
     };
   }, []);
 
-  const send = () => {
+  // One turn. `seed` is an optional instruction prepended (Draft reply). A
+  // reopened conversation replays its transcript as context on the next turn.
+  const submit = (seed?: string) => {
     if (running) return;
+    resetStream();
     const text = input.trim();
+    const replay = replayPendingRef.current;
     const first = messages.length === 0;
-    if (!first && !text) {
+    if (!text && !seed && !replay) {
       setStatus({ label: "type a message", tone: "warning" });
       return;
     }
-    // The first turn carries the CS instruction; follow-ups are the raw message.
-    const prompt = first ? [tool.instruction, text].filter(Boolean).join("\n\n") : text;
-    const shown = first ? text || "Draft a reply to the open ticket" : text;
+    let prompt: string;
+    if (replay) {
+      prompt = buildReplayPrompt(messagesRef.current, seed ? `${seed}\n\n${text}` : text);
+      replayPendingRef.current = false;
+    } else if (first) {
+      prompt = [seed || GENERAL_PREAMBLE, text].filter(Boolean).join("\n\n");
+    } else {
+      prompt = seed ? [seed, text].filter(Boolean).join("\n\n") : text;
+    }
+    const shown = text || (seed ? "Draft a reply to the open ticket" : "(continue)");
 
     setMessages((ms) => [...ms, { role: "user", text: shown }, { role: "assistant", text: "" }]);
     setInput("");
@@ -257,23 +456,63 @@ export default function App() {
     activeRef.current = id;
     setRunning(true);
     setStatus({ label: "running…", tone: "info" });
-    bridgeRef.current?.send({ id, cli, prompt, tools: readPageOn && tool.usesTools, model, effort });
+    bridgeRef.current?.send({ id, prompt, ...buildCfg() });
   };
 
   const stop = () => {
     if (activeRef.current === null) return;
     bridgeRef.current?.cancel(activeRef.current); // interrupt — keeps the conversation
+    flushStream(); // show whatever streamed so far
     setStatus({ label: "stopping…", tone: "warning" });
   };
+  stopRef.current = stop;
 
   const newChat = () => {
-    bridgeRef.current?.reset({ cli, tools: readPageOn && tool.usesTools, model, effort });
+    saveCurrent(); // keep the one we're leaving
+    resetStream();
+    bridgeRef.current?.reset(buildCfg());
     activeRef.current = null;
+    convIdRef.current = null;
+    replayPendingRef.current = false;
     setRunning(false);
     setMessages([]);
     setInput("");
     setStatus({ label: "ready", tone: "idle" });
-    void loadSummary(); // switching tickets → re-detect the merchant
+  };
+
+  const openHistory = async () => {
+    setHistoryList(await loadConversations());
+    setHistoryOpen(true);
+  };
+
+  // Reopen a saved conversation: show its transcript and arm a context replay so
+  // the next message continues it in a fresh session.
+  const openConversation = (conv: Conversation) => {
+    saveCurrent(); // save the current one before switching away
+    resetStream();
+    const msgs: Msg[] = conv.messages.map((m) => ({ role: m.role, text: m.text }));
+    setMessages(msgs);
+    messagesRef.current = msgs;
+    convIdRef.current = conv.id;
+    replayPendingRef.current = true;
+    bridgeRef.current?.reset(buildCfg());
+    activeRef.current = null;
+    setRunning(false);
+    setInput("");
+    setStatus({ label: "resumed — send to continue", tone: "idle" });
+    setHistoryOpen(false);
+  };
+
+  const removeConversation = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    await deleteConversation(id);
+    if (convIdRef.current === id) convIdRef.current = null;
+    setHistoryList(await loadConversations());
+  };
+
+  const clearHistory = async () => {
+    await clearConversations();
+    setHistoryList([]);
   };
 
   const copy = async (idx: number, text: string) => {
@@ -289,7 +528,7 @@ export default function App() {
   const onKeyDown = (e: React.KeyboardEvent) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
-      send();
+      submit();
     }
   };
 
@@ -300,14 +539,69 @@ export default function App() {
     <div className="flex h-screen flex-col bg-bg text-fg">
       <header className="flex items-center gap-2 border-b border-border px-3 py-2.5">
         <span className="flex h-6 w-6 items-center justify-center rounded-md bg-accent-soft text-accent">
-          <Icon className="h-4 w-4" />
+          <Sparkles className="h-4 w-4" />
         </span>
-        <span className="text-sm font-semibold">{tool.name}</span>
+        <span className="text-sm font-semibold">{APP_NAME}</span>
         <div className="ml-auto flex items-center gap-1">
           <StatusPill status={status} />
+
+          {/* history */}
+          <div className="relative">
+            <IconBtn
+              label="History"
+              onClick={() => (historyOpen ? setHistoryOpen(false) : void openHistory())}
+              className={historyOpen ? "bg-border/50 text-fg" : ""}
+            >
+              <History className="h-4 w-4" />
+            </IconBtn>
+            {historyOpen && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setHistoryOpen(false)} />
+                <div className="absolute right-0 top-full z-50 mt-1.5 max-h-[70vh] w-72 overflow-y-auto rounded-xl border border-neutral-200 bg-white p-1.5 text-neutral-800 shadow-lg">
+                  {historyList.length === 0 ? (
+                    <p className="px-2 py-3 text-center text-xs text-neutral-500">No saved conversations yet.</p>
+                  ) : (
+                    <>
+                      {historyList.map((c) => (
+                        <div
+                          key={c.id}
+                          onClick={() => openConversation(c)}
+                          className="group flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-neutral-100"
+                        >
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate text-sm">{c.title}</span>
+                            <span className="block text-[10px] text-neutral-500">
+                              {relTime(c.updatedAt)} · {c.messages.length} msgs
+                            </span>
+                          </span>
+                          <span
+                            role="button"
+                            aria-label="Delete conversation"
+                            onClick={(e) => removeConversation(c.id, e)}
+                            className="shrink-0 rounded p-1 text-neutral-400 opacity-0 hover:bg-neutral-200 hover:text-neutral-700 group-hover:opacity-100"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </span>
+                        </div>
+                      ))}
+                      <button
+                        onClick={clearHistory}
+                        className="mt-1 w-full rounded-lg px-2 py-1.5 text-left text-xs text-neutral-500 hover:bg-neutral-100"
+                      >
+                        Clear all
+                      </button>
+                    </>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+
           <IconBtn label="New chat" onClick={newChat} disabled={empty && !running}>
             <Plus className="h-4 w-4" />
           </IconBtn>
+
+          {/* settings */}
           <div className="relative">
             <IconBtn
               label="Settings"
@@ -328,12 +622,58 @@ export default function App() {
                     <input
                       type="checkbox"
                       className="h-4 w-4 accent-accent"
-                      checked={readPageOn}
-                      onChange={(e) => setReadPageOn(e.target.checked)}
+                      checked={pageOn}
+                      onChange={(e) => setPageOn(e.target.checked)}
                     />
                     <Globe className="h-4 w-4 text-muted" />
-                    Let Claude read the page
+                    Read &amp; control page
                   </label>
+                  <label className="mt-2 flex cursor-pointer items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 accent-accent"
+                      checked={captureOn}
+                      onChange={(e) => setCaptureOn(e.target.checked)}
+                    />
+                    <Bug className="h-4 w-4 text-muted" />
+                    Allow console &amp; network capture
+                  </label>
+                  {captureOn && (
+                    <p className="mt-1 pl-6 text-[10px] leading-tight text-neutral-500">
+                      {captureStatus?.error
+                        ? `⚠️ ${captureStatus.error}`
+                        : captureStatus?.attached
+                          ? `● capturing tab ${captureStatus.tabId} — Chrome shows a "being debugged" banner.`
+                          : 'AI attaches this when it needs console/network (Chrome shows a "being debugged" banner then).'}
+                    </p>
+                  )}
+                  <div className="mt-2.5 flex flex-col gap-1">
+                    <span className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-neutral-500">
+                      <FolderGit2 className="h-3.5 w-3.5" />
+                      Local repo path
+                    </span>
+                    <div className="flex gap-1.5">
+                      <input
+                        value={repoPath}
+                        onChange={(e) => setRepoPath(e.target.value)}
+                        placeholder="/Users/you/Workspace/your-repo"
+                        spellCheck={false}
+                        className="min-w-0 flex-1 rounded-lg border border-neutral-300 bg-white px-2.5 py-1.5 text-sm text-neutral-800 outline-none placeholder:text-neutral-400 focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/30"
+                      />
+                      <button
+                        type="button"
+                        onClick={browseRepo}
+                        disabled={browsing}
+                        title="Pick a folder"
+                        className="shrink-0 rounded-lg border border-neutral-300 bg-white px-2.5 py-1.5 text-sm text-neutral-700 hover:bg-neutral-100 disabled:opacity-50"
+                      >
+                        {browsing ? "…" : "Browse…"}
+                      </button>
+                    </div>
+                    <span className="text-[10px] leading-tight text-neutral-500">
+                      When set, Claude may read &amp; grep files here (no writes, no shell).
+                    </span>
+                  </div>
                   <label className="mt-2.5 flex flex-col gap-1">
                     <span className="text-[11px] font-medium uppercase tracking-wide text-neutral-500">
                       Merchant API URL
@@ -363,7 +703,11 @@ export default function App() {
                       is_admin key for pod-shopify-backend; stored in this panel.
                     </span>
                   </label>
-                  {live && <p className="mt-2 text-[11px] text-neutral-500">Model/effort apply to a new chat.</p>}
+                  {live && (
+                    <p className="mt-2 text-[11px] text-neutral-500">
+                      Model, effort, page/capture/repo apply to a new chat.
+                    </p>
+                  )}
                 </div>
               </>
             )}
@@ -371,29 +715,43 @@ export default function App() {
         </div>
       </header>
 
-      {/* pinned merchant summary — stays at top while the chat scrolls under it */}
-      <MerchantCard summary={summary} state={summaryState} err={summaryErr} onRefresh={loadSummary} />
+      {/* pinned merchant summary — only when a shop is detected on the page */}
+      {shopDetected && (
+        <MerchantCard
+          summary={summary}
+          state={summaryState}
+          err={summaryErr}
+          onRefresh={loadSummary}
+          onDraftReply={() => submit(DRAFT_REPLY_INSTRUCTION)}
+          busy={running}
+        />
+      )}
 
       {/* message list */}
       <div className="flex-1 overflow-y-auto px-3 py-3">
         {empty ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-muted">
-            <Icon className="h-7 w-7 opacity-60" />
-            <p className="text-sm">{tool.blurb}</p>
-            <p className="text-xs">Hit {tool.verb} to draft from the open ticket, then refine by chatting.</p>
+            <Sparkles className="h-7 w-7 opacity-60" />
+            <p className="text-sm">Ask anything, or tell me what to do on this tab.</p>
+            <p className="text-xs">
+              I can read &amp; control the page, debug its console/network, and read your repo. On a Featurebase ticket,
+              use “Draft reply” on the merchant card.
+            </p>
           </div>
         ) : (
           <div className="flex flex-col gap-3">
             {messages.map((m, i) =>
               m.role === "user" ? (
                 <div key={i} className="max-w-[85%] self-end rounded-xl rounded-br-sm bg-accent px-3 py-2 text-sm text-accent-fg">
-                  <pre className="fb-out">{m.text}</pre>
+                  <div className="whitespace-pre-wrap break-words">{m.text}</div>
                 </div>
               ) : (
                 <div key={i} className="group max-w-[92%] self-start rounded-xl rounded-bl-sm border border-border bg-surface px-3 py-2">
-                  <pre className="fb-out text-sm">
-                    {m.text || (running && i === messages.length - 1 ? "…" : "")}
-                  </pre>
+                  {m.text ? (
+                    <AssistantText text={m.text} />
+                  ) : running && i === messages.length - 1 ? (
+                    <span className="text-sm text-muted">…</span>
+                  ) : null}
                   {m.text && (
                     <button
                       onClick={() => copy(i, m.text)}
@@ -416,7 +774,7 @@ export default function App() {
         <textarea
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder={empty ? tool.inputPlaceholder : "Reply to the assistant…"}
+          placeholder="Ask anything, or tell me what to do on this tab…"
           rows={empty ? 3 : 2}
           className="w-full resize-none rounded-xl border border-border bg-surface px-3 py-2.5 text-sm outline-none placeholder:text-muted focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/30"
         />
@@ -431,10 +789,13 @@ export default function App() {
             </button>
           ) : (
             <button
-              onClick={send}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-2 text-sm font-medium text-accent-fg transition-opacity hover:opacity-90"
+              onClick={() => submit()}
+              disabled={!input.trim()}
+              aria-label="Send message"
+              title="Send (⌘/Ctrl+↵)"
+              className="inline-flex h-9 w-9 items-center justify-center rounded-lg bg-accent text-accent-fg transition-opacity hover:opacity-90 disabled:opacity-30"
             >
-              {empty ? tool.verb : "Send"}
+              <ArrowUp className="h-4 w-4" />
             </button>
           )}
           {running && <LoaderCircle className="h-4 w-4 animate-spin text-muted" />}
@@ -482,15 +843,19 @@ function MerchantCard({
   state,
   err,
   onRefresh,
+  onDraftReply,
+  busy,
 }: {
   summary: ShopSummary | null;
-  state: "loading" | "idle" | "empty" | "error";
+  state: "loading" | "idle" | "error";
   err?: string;
   onRefresh: () => void;
+  onDraftReply: () => void;
+  busy: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [copiedEmail, setCopiedEmail] = useState(false);
-  const clickable = !!summary && state !== "empty";
+  const clickable = !!summary;
 
   const copyEmail = (e: React.MouseEvent, email: string) => {
     e.stopPropagation();
@@ -505,10 +870,7 @@ function MerchantCard({
 
   return (
     <div className="relative mx-3 mt-2 shrink-0 rounded-xl border border-border bg-surface">
-      <div
-        className={cx("px-3 pt-2.5", clickable && "cursor-pointer")}
-        onClick={clickable ? () => setOpen((o) => !o) : undefined}
-      >
+      <div className={cx("px-3 pt-2.5", clickable && "cursor-pointer")} onClick={clickable ? () => setOpen((o) => !o) : undefined}>
         <div className="flex items-center gap-2">
           <Store className="h-4 w-4 shrink-0 text-muted" />
           <span className="truncate text-sm font-semibold">
@@ -517,26 +879,37 @@ function MerchantCard({
           {clickable && (
             <ChevronDown className={cx("h-3.5 w-3.5 shrink-0 text-muted transition-transform", open && "rotate-180")} />
           )}
-          <button
-            aria-label="Refresh merchant"
-            title="Refresh"
-            onClick={(e) => {
-              e.stopPropagation();
-              onRefresh();
-            }}
-            className="ml-auto inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-muted hover:bg-border/40 hover:text-fg"
-          >
-            <RefreshCw className={cx("h-3.5 w-3.5", state === "loading" && "animate-spin")} />
-          </button>
+          <div className="ml-auto flex shrink-0 items-center gap-1">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onDraftReply();
+              }}
+              disabled={busy}
+              title="Draft a support reply into the chat"
+              className="inline-flex items-center gap-1 rounded-lg bg-accent-soft px-2 py-1 text-xs font-medium text-accent transition-opacity hover:opacity-90 disabled:opacity-40"
+            >
+              <Headset className="h-3.5 w-3.5" />
+              Draft reply
+            </button>
+            <button
+              aria-label="Refresh merchant"
+              title="Refresh"
+              onClick={(e) => {
+                e.stopPropagation();
+                onRefresh();
+              }}
+              className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-muted hover:bg-border/40 hover:text-fg"
+            >
+              <RefreshCw className={cx("h-3.5 w-3.5", state === "loading" && "animate-spin")} />
+            </button>
+          </div>
         </div>
 
-        {state === "empty" && (
-          <p className="pb-2.5 pt-1 text-xs text-muted">No shop detected on this page. Open a ticket, then hit ↻.</p>
-        )}
         {state === "error" && <p className="pb-2.5 pt-1 text-xs text-muted">⚠️ {err || "lookup failed"}</p>}
         {state === "loading" && !summary && <p className="pb-2.5 pt-1 text-xs text-muted">Loading account summary…</p>}
 
-        {summary && state !== "empty" && (
+        {summary && (
           <div className="pb-2.5 pt-1.5">
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
               <span className="rounded-md bg-accent-soft px-1.5 py-0.5 font-medium text-accent">

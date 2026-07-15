@@ -9,13 +9,16 @@ const icons = {
 
 export default defineManifest({
   manifest_version: 3,
-  name: "Nexlify FB Assistant",
+  name: "Nexlify Assistant",
   version: "0.2.0",
   description:
-    "Personal side-panel assistant: a local Claude/ChatGPT CLI that can read the page DOM to translate, research, and draft replies.",
+    "Personal side-panel assistant: a local Claude CLI that can read & control the page, debug its console/network, and read a local repo.",
   icons,
   action: { default_title: "Open Assistant", default_icon: icons },
-  permissions: ["sidePanel", "nativeMessaging", "scripting", "tabs"],
+  // "debugger" powers the console/network capture (CDP), gated behind the
+  // "Capture console & network" setting (off by default) since attaching shows
+  // Chrome's "being debugged" banner. "storage" persists conversation history.
+  permissions: ["sidePanel", "nativeMessaging", "scripting", "tabs", "debugger", "storage"],
   host_permissions: ["<all_urls>"],
   background: { service_worker: "src/background.ts", type: "module" },
   side_panel: { default_path: "src/sidepanel/index.html" },

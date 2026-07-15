@@ -14,7 +14,7 @@
 //
 // IMPORTANT: never write to stdout except framed messages — use log() (stderr).
 
-const { spawn } = require("child_process");
+const { spawn, execFile } = require("child_process");
 const net = require("net");
 const os = require("os");
 const path = require("path");
@@ -109,16 +109,52 @@ try {
 // written to stdin so we can spawn/prewarm before we have it). `tools` is
 // already gated by supportsTools.
 
-const BRIDGE_TOOLS = "mcp__fbbridge__get_page,mcp__fbbridge__query_dom";
-// Keep Claude a pure responder: no shell / file mutations, only our DOM tools.
+// Browser tools exposed over the fbbridge MCP. PAGE = read + control the live
+// tab; DEBUG = read the console/network capture buffer. The panel gates each
+// group with a setting; we advertise only the enabled ones (FB_TOOLS).
+const PAGE_TOOLS = ["get_page", "query_dom", "screenshot", "click", "type_text", "press_key", "scroll_to", "wait_for"];
+const DEBUG_TOOLS = ["get_console_logs", "get_network_requests", "get_network_request"];
+// Built-in Claude tools allowed only when a local repo path is set (read-only).
+const REPO_TOOLS = ["Read", "Grep", "Glob"];
+// Never let Claude mutate the machine: no shell, no file writes.
 const NO_BUILTIN_TOOLS = "Bash,Edit,Write,MultiEdit,NotebookEdit";
 
-function bridgeConfig() {
+function bridgeConfig(toolNames) {
   return JSON.stringify({
     mcpServers: {
-      fbbridge: { command: process.execPath, args: [MCP_SERVER], env: { FB_BRIDGE_SOCK: SOCK } },
+      fbbridge: {
+        command: process.execPath,
+        args: [MCP_SERVER],
+        env: { FB_BRIDGE_SOCK: SOCK, FB_TOOLS: toolNames.join(",") },
+      },
     },
   });
+}
+
+// A repo path is usable only if it points at a real directory; otherwise drop
+// it (cwd falls back to tmpdir and the file tools stay off).
+function validRepo(p) {
+  const s = String(p || "").trim();
+  if (!s) return "";
+  try {
+    if (fs.statSync(s).isDirectory()) return s;
+  } catch {}
+  log("repo path is not a directory, ignoring:", s);
+  return "";
+}
+
+// Normalize a panel message into the launch config, gating the tool groups
+// behind the provider actually supporting tools.
+function sessionCfg(msg) {
+  const provider = PROVIDERS[msg.cli];
+  const canTools = !!(provider && provider.supportsTools);
+  return {
+    page: canTools && !!msg.page,
+    capture: canTools && !!msg.capture,
+    repoPath: validRepo(msg.repoPath),
+    model: msg.model || "",
+    effort: msg.effort || "",
+  };
 }
 
 const PROVIDERS = {
@@ -126,7 +162,7 @@ const PROVIDERS = {
     cmd: process.env.CLAUDE_BIN || "claude",
     format: "claude-stream-json",
     supportsTools: true,
-    buildArgs({ tools, model, effort }) {
+    buildArgs({ page, capture, repoPath, model, effort }) {
       const a = [
         "-p",
         "--input-format",
@@ -141,8 +177,14 @@ const PROVIDERS = {
       ];
       if (model) a.push("--model", model);
       if (effort) a.push("--effort", effort);
-      if (tools) a.push("--mcp-config", bridgeConfig(), "--allowedTools", BRIDGE_TOOLS);
+      const bridgeTools = [];
+      if (page) bridgeTools.push(...PAGE_TOOLS);
+      if (capture) bridgeTools.push(...DEBUG_TOOLS);
+      const allowed = bridgeTools.map((n) => "mcp__fbbridge__" + n);
+      if (repoPath) allowed.push(...REPO_TOOLS); // cwd is set to the repo in spawnSession
+      if (bridgeTools.length) a.push("--mcp-config", bridgeConfig(bridgeTools));
       else a.push("--mcp-config", '{"mcpServers":{}}');
+      if (allowed.length) a.push("--allowedTools", allowed.join(","));
       return a;
     },
   },
@@ -179,10 +221,12 @@ function emitStreamLine(id, line) {
   if (ev.type === "content_block_delta" && ev.delta && ev.delta.type === "text_delta") {
     send({ id, type: "chunk", data: ev.delta.text });
   } else if (ev.type === "content_block_start" && ev.content_block && ev.content_block.type === "tool_use") {
-    const name = ev.content_block.name || "";
-    if (name.indexOf("fbbridge") !== -1) {
-      send({ id, type: "tool_use", name: name.replace(/^mcp__fbbridge__/, "") });
-    }
+    // Surface the tool name (our bridge tools stripped of the mcp prefix; the
+    // built-in Read/Grep/Glob shown as-is) so the panel can show "→ click" etc.
+    const name = ev.content_block.name || "tool";
+    send({ id, type: "tool_use", name: name.replace(/^mcp__fbbridge__/, "") });
+  } else if (ev.type === "content_block_start" && ev.content_block && ev.content_block.type === "thinking") {
+    send({ id, type: "thinking" });
   }
   return null;
 }
@@ -192,18 +236,18 @@ function emitStreamLine(id, line) {
 // Sessions are interchangeable only if their launch config matches — model,
 // effort, and whether the DOM tools (and thus MCP) are wired in.
 function cfgKey(msg) {
-  const provider = PROVIDERS[msg.cli];
-  const tools = !!msg.tools && !!(provider && provider.supportsTools);
-  return JSON.stringify({ cli: msg.cli, tools, model: msg.model || "", effort: msg.effort || "" });
+  const c = sessionCfg(msg);
+  return JSON.stringify({ cli: msg.cli, page: c.page, capture: c.capture, repoPath: c.repoPath, model: c.model, effort: c.effort });
 }
 
 // Spawn an idle stream-json session for this config. The user turn arrives
-// later over stdin, so cold-start runs now instead of after the click.
+// later over stdin, so cold-start runs now instead of after the click. cwd is
+// the local repo when one is set, so Claude's Read/Grep/Glob resolve there.
 function spawnSession(msg) {
   const provider = PROVIDERS[msg.cli];
-  const tools = !!msg.tools && provider.supportsTools;
-  const argv = provider.buildArgs({ tools, model: msg.model, effort: msg.effort });
-  return spawn(provider.cmd, argv, { env: RUN_ENV, cwd: os.tmpdir() });
+  const c = sessionCfg(msg);
+  const argv = provider.buildArgs(c);
+  return spawn(provider.cmd, argv, { env: RUN_ENV, cwd: c.repoPath || os.tmpdir() });
 }
 
 // Keep (at most) one prewarmed session matching the current settings.
@@ -478,12 +522,32 @@ function toolResult(msg) {
   }
 }
 
+// Native folder picker (macOS): pops the standard "choose folder" dialog and
+// hands back the POSIX path so the user never types the repo path. Cancelling
+// the dialog is normal — reply with an empty path and no error.
+function pickFolder(msg) {
+  const reply = (p, error) => send({ id: msg.id, type: "folder_picked", path: p || "", error });
+  const script =
+    'POSIX path of (choose folder with prompt "Select the repo or workspace folder for the assistant")';
+  execFile("osascript", ["-e", script], { timeout: 120000 }, (err, stdout) => {
+    if (err) {
+      // -128 = the user pressed Cancel; not a real error.
+      const detail = String((err && (err.stderr || err.message)) || "");
+      if (/-128|User canceled/i.test(detail)) return reply("");
+      return reply("", detail || "folder picker failed");
+    }
+    // choose folder yields a trailing-slash path; drop it so it reads normally.
+    reply(String(stdout || "").trim().replace(/\/+$/, ""));
+  });
+}
+
 function handle(msg) {
   if (msg.type === "cancel") cancel(msg.id);
   else if (msg.type === "tool_result") toolResult(msg);
   else if (msg.type === "prewarm") prewarm(msg);
   else if (msg.type === "reset") reset(msg);
   else if (msg.type === "shop_summary") shopSummary(msg);
+  else if (msg.type === "pick_folder") pickFolder(msg);
   else run(msg);
 }
 

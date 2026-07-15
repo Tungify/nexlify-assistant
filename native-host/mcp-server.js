@@ -10,7 +10,10 @@ const net = require("net");
 const SOCK = process.env.FB_BRIDGE_SOCK;
 const PROTOCOL = "2024-11-05";
 
+// Full catalog. The host narrows it per session via FB_TOOLS (see ACTIVE_TOOLS)
+// so only the tools the user enabled in settings are advertised/callable.
 const TOOLS = [
+  // ---- read ----
   {
     name: "get_page",
     description:
@@ -18,25 +21,153 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        maxChars: { type: "number", description: "Max characters of body text (default 12000)." },
+        maxChars: { type: "number", description: "Max characters of body text (default 6000)." },
       },
     },
   },
   {
     name: "query_dom",
     description:
-      "Query the current tab's DOM with a CSS selector. Returns { count, matches } — the innerText (or outerHTML if html=true) of matched elements. Use for targeted extraction.",
+      "Query the current tab's DOM with a CSS selector. Returns { count, matches } — the innerText (or outerHTML if html=true) of matched elements. Use for targeted extraction and to find selectors before clicking/typing.",
     inputSchema: {
       type: "object",
       properties: {
         selector: { type: "string", description: "CSS selector." },
         limit: { type: "number", description: "Max elements (default 20)." },
-        html: { type: "boolean", description: "Return outerHTML instead of text." },
+        html: { type: "boolean", description: "Return outerHTML instead of text (useful to discover attributes/selectors)." },
       },
       required: ["selector"],
     },
   },
+  {
+    name: "screenshot",
+    description:
+      "Capture a screenshot of the VISIBLE area of the current tab and return it as an image you can actually look at. Use when the DOM/text isn't enough — to check layout, rendering, canvas/image content, or to confirm a UI state visually.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        format: { type: "string", enum: ["jpeg", "png"], description: "Image format (default jpeg — smaller; use png for crisp text/UI)." },
+        quality: { type: "number", description: "JPEG quality 0-100 (default 80; ignored for png)." },
+      },
+    },
+  },
+  // ---- control (write) ----
+  {
+    name: "click",
+    description:
+      "Click an element in the current tab (fires mousedown/mouseup + a real click, so navigation/submit and React handlers all run). Find the selector with query_dom first if unsure.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        selector: { type: "string", description: "CSS selector of the element to click." },
+        nth: { type: "number", description: "0-based index when the selector matches several (default 0)." },
+      },
+      required: ["selector"],
+    },
+  },
+  {
+    name: "type_text",
+    description:
+      "Type text into an <input>/<textarea> or a contenteditable rich editor (e.g. a reply box). Dispatches the events frameworks expect. Set replace=true to overwrite existing content, submit=true to press Enter / submit the form afterwards.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        selector: { type: "string", description: "CSS selector of the field." },
+        text: { type: "string", description: "Text to enter." },
+        replace: { type: "boolean", description: "Clear the field first (default false = append)." },
+        submit: { type: "boolean", description: "Press Enter / requestSubmit after typing (default false)." },
+      },
+      required: ["selector", "text"],
+    },
+  },
+  {
+    name: "press_key",
+    description:
+      "Dispatch a single keyboard key to an element (or the focused element). Use for Enter, Escape, Tab, Backspace, Arrow keys, etc.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: 'Key name, e.g. "Enter", "Escape", "Tab", "ArrowDown", or a single character.' },
+        selector: { type: "string", description: "Optional target selector; defaults to the active element." },
+      },
+      required: ["key"],
+    },
+  },
+  {
+    name: "scroll_to",
+    description: "Scroll an element into view (center of the viewport).",
+    inputSchema: {
+      type: "object",
+      properties: { selector: { type: "string", description: "CSS selector." } },
+      required: ["selector"],
+    },
+  },
+  {
+    name: "wait_for",
+    description:
+      "Wait until an element appears/becomes visible/disappears (polls up to timeoutMs). Use after a click that triggers async UI before reading or acting again.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        selector: { type: "string", description: "CSS selector." },
+        state: { type: "string", enum: ["present", "visible", "gone"], description: 'Target state (default "present").' },
+        timeoutMs: { type: "number", description: "Max wait in ms (default 5000, capped 30000)." },
+      },
+      required: ["selector"],
+    },
+  },
+  // ---- debug (console + network capture; the CDP debugger attaches the first
+  // time you call one of these, so capturing starts NOW — to observe a request
+  // that fires on an action, call get_network_requests once first, then do the
+  // action, then read again) ----
+  {
+    name: "get_console_logs",
+    description:
+      "Read recent console output captured from the active tab (console.*, uncaught errors, and browser log entries like CORS/CSP/mixed-content). Capturing begins when this is first called. Use to debug why something failed on the page.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        level: { type: "string", description: 'Filter by level prefix, e.g. "error", "warn", "info".' },
+        contains: { type: "string", description: "Only entries whose text contains this substring." },
+        limit: { type: "number", description: "Max entries, newest last (default 100)." },
+      },
+    },
+  },
+  {
+    name: "get_network_requests",
+    description:
+      "List network requests captured from the active tab (method, URL, status, type). Capturing begins when this is first called, so to catch a request triggered by an action (e.g. a beacon on navigation/unload), call this once to start capturing, perform the action, then call it again. Filter to narrow down, then get_network_request for full detail.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        urlContains: { type: "string", description: "Only requests whose URL contains this substring." },
+        method: { type: "string", description: "HTTP method filter, e.g. POST." },
+        status: { type: "number", description: "Exact HTTP status filter." },
+        failedOnly: { type: "boolean", description: "Only failed requests or status >= 400." },
+        resourceType: { type: "string", description: 'e.g. "XHR", "Fetch", "Script", "Document".' },
+        limit: { type: "number", description: "Max requests, newest last (default 50)." },
+      },
+    },
+  },
+  {
+    name: "get_network_request",
+    description:
+      "Full detail for one captured request by id (from get_network_requests): request headers + body, response headers + body, status, and any error. Bodies are fetched on demand and may be unavailable if evicted.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string", description: "The request id from get_network_requests." } },
+      required: ["id"],
+    },
+  },
 ];
+
+// The host sets FB_TOOLS to the comma-separated names it enabled for this
+// session; advertise/allow only those. Unset (e.g. run standalone) = all tools.
+const ENABLED = (process.env.FB_TOOLS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const ACTIVE_TOOLS = ENABLED.length ? TOOLS.filter((t) => ENABLED.includes(t.name)) : TOOLS;
 
 // ---- unix socket to host.js ----------------------------------------------
 
@@ -131,17 +262,21 @@ async function handle(req) {
       reply(id, {});
       break;
     case "tools/list":
-      reply(id, { tools: TOOLS });
+      reply(id, { tools: ACTIVE_TOOLS });
       break;
     case "tools/call": {
       const name = params && params.name;
       const args = (params && params.arguments) || {};
-      if (!TOOLS.some((t) => t.name === name)) {
+      if (!ACTIVE_TOOLS.some((t) => t.name === name)) {
         return replyError(id, -32602, "unknown tool: " + name);
       }
       try {
         const data = await callTool(name, args);
-        reply(id, { content: [{ type: "text", text: JSON.stringify(data) }] });
+        if (name === "screenshot" && data && data.base64) {
+          reply(id, { content: [{ type: "image", data: data.base64, mimeType: data.mimeType || "image/jpeg" }] });
+        } else {
+          reply(id, { content: [{ type: "text", text: JSON.stringify(data) }] });
+        }
       } catch (e) {
         reply(id, { content: [{ type: "text", text: "Error: " + e.message }], isError: true });
       }

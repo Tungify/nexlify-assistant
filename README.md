@@ -1,17 +1,26 @@
-# Nexlify FB Assistant
+# Nexlify Assistant
 
-Personal Chrome **side-panel** assistant (React + Shopify Polaris) backed by your
-**local** `claude` / `chatgpt` CLI. It can:
+Personal Chrome **side-panel** assistant (React + Tailwind) backed by your
+**local** `claude` CLI. It's a general-purpose, agentic helper for whatever page
+you're on — it can:
 
-- draft a Featurebase support reply for the open ticket, then **refine it in a
-  back-and-forth chat** ("make it shorter", "the customer is on Pro", …) — the
-  assistant keeps the conversation context;
-- show a **pinned merchant card** at the top of the panel: the shop's plan +
-  status, how long they've used the app, option-set / design-template / order
-  counts, credit balance, and renewal date — auto-loaded from the shop on the
-  open ticket (see **Merchant summary** below);
-- read the tab you're looking at — **Claude itself calls DOM tools**
-  (`get_page`, `query_dom`) to read the conversation while it reasons (agentic).
+- **read and drive the current tab** — Claude calls browser tools itself
+  (`get_page` / `query_dom` to read; `click` / `type_text` / `press_key` /
+  `scroll_to` / `wait_for` to act), e.g. translate something on the page and type
+  it into a field;
+- **debug the page** — with capture on it collects console output and network
+  requests (`get_console_logs`, `get_network_requests`, `get_network_request`)
+  so it can tell you why an event/request didn't fire;
+- **read a local repo** you point it at (`Read` / `Grep` / `Glob`, read-only) to
+  cross-reference the code behind a bug;
+- **keep a conversation history** — every chat is saved locally; reopen one from
+  the ⏱ menu and keep going (the transcript is replayed as context).
+
+It's **context-aware**: open a **Featurebase** ticket and it surfaces a pinned
+**merchant card** (the shop's plan/status, usage counts, credit balance, renewal
+— see **Merchant summary**) plus a one-tap **Draft reply**; on any other page the
+card stays hidden and it's just a clean chat. Everything Claude produces stays
+**in the chat** (copy/paste) — it never submits anything to Featurebase.
 
 No API keys and no daemon: Chrome launches the native host on demand and it dies
 when the panel closes.
@@ -19,23 +28,27 @@ when the panel closes.
 ## Architecture
 
 ```
-Side panel (React/Polaris)
-  ├─ chrome.runtime.connectNative ─────────────► host.js  (spawned on demand)
-  │                                                 │
-  │   chat: {id,cli,prompt,tools}  →  streams text  │ spawn: claude -p --output-format stream-json …
-  │                                                 │   (or codex exec …)
-  │                                                 │
-  │   ◄── tool_request {get_page|query_dom} ────────┤  unix socket
-  │   ──► tool_result (DOM data) ───────────────────┤     ▲
-  │        (runs chrome.scripting.executeScript)    │     │ JSONL
-  └─                                                 └─ mcp-server.js  (spawned by claude)
-                                                          exposes get_page / query_dom as MCP tools
+Side panel (React/Tailwind)
+  ├─ chrome.runtime.connectNative ─────────────────► host.js  (spawned on demand)
+  │                                                     │
+  │   chat: {id,prompt,page,capture,repo}  → streams    │ spawn: claude -p --output-format stream-json …
+  │                                                     │
+  │   ◄── tool_request {get_page|click|type_text|…} ────┤  unix socket
+  │   ──► tool_result ──────────────────────────────────┤     ▲
+  │        (chrome.scripting for page tools;            │     │ JSONL
+  │         CDP capture buffer for debug tools)         │     │
+  └─                                                     └─ mcp-server.js  (spawned by claude)
+                                                              exposes the enabled tools (FB_TOOLS)
 ```
 
-When "Let Claude read the page" is on, `host.js` starts Claude with an MCP server
-(`mcp-server.js`) whose tools tunnel — over a unix socket — back through the
-host to the extension, which runs them against the live DOM. Everything is a
-child of the on-demand host; nothing persists.
+When **Read & control page** is on, `host.js` starts Claude with an MCP server
+(`mcp-server.js`) whose tools tunnel — over a unix socket — back through the host
+to the extension, which runs them against the live DOM (reads *and* writes).
+**Capture console & network** additionally attaches Chrome's debugger (CDP) to
+the tab and buffers console + network events for the debug tools. A **Local repo
+path** launches Claude with its cwd there and read-only `Read`/`Grep`/`Glob`
+allowed. The host advertises only the tool groups you enabled (via `FB_TOOLS`).
+Everything is a child of the on-demand host; nothing persists.
 
 ## Prerequisites
 
@@ -61,21 +74,39 @@ npm run build          # outputs dist/
 
 Re-run `npm run build` after code changes (the unpacked ID stays the same as
 long as `dist/` keeps its path, so you don't need to re-run `install.sh`).
-For live development use `npm run dev` instead of the build.
+For live development use `npm run dev` instead of the build. This version adds
+the **`debugger`** (console/network capture) and **`storage`** (conversation
+history) permissions — after building, hit **Reload** on the extension in
+`chrome://extensions` so Chrome grants them. Edits to `host.js` /
+`mcp-server.js` take effect on the next panel open (they run from the repo, not
+`dist/`), no reinstall needed.
 
 ## Usage
 
-- Open the ticket in the tab, then hit **Draft reply** (or ⌘/Ctrl+Enter). The
-  optional text box is extra guidance for the first turn (tone, facts).
-- Then just keep typing to refine — it's a chat; the assistant remembers the
-  thread. **＋** starts a new chat (and picks up any changed settings). **Stop**
+- **Type any task** and hit ⌘/Ctrl+Enter (or the ▲ button) — "translate this page
+  into English", "why didn't the save button fire?", "read `foo.ts` and explain
+  X", etc. It's a chat: keep typing to refine; the assistant remembers the thread.
+  **＋** saves the current chat to history and starts a fresh one; **Stop**
   interrupts the current reply but keeps the conversation.
-- Toggle **Let Claude read the page** (settings) to allow the DOM tools; the
-  status pill shows `→ get_page` when Claude is reading the ticket.
-- The **merchant card** auto-loads on open / New chat; hit ↻ to re-detect after
-  switching tickets. Compact tiles = option sets · designs · orders · shops;
-  **click the card** to expand full details (contact + copy email, plan / $ /
-  MRR / activated / renewal, usage, credits, shop status = installed-or-not).
+- **History (⏱)** lists saved conversations; reopen one to view it and keep
+  chatting (the transcript is replayed as context into a fresh session). Delete
+  individually or **Clear all**.
+- **Settings** (⚙) gate what Claude may do; they apply to the next chat:
+  - **Read & control page** — the browser tools (`get_page`, `query_dom`,
+    `click`, `type_text`, `press_key`, `scroll_to`, `wait_for`). The status pill
+    shows `→ click` etc. while Claude acts. Write actions run **automatically**
+    (no confirmation), so watch it on live tickets.
+  - **Capture console & network** — attaches Chrome's debugger to the active tab
+    (you'll see a yellow "being debugged" banner) and buffers console + network
+    so Claude can debug why something didn't fire. Off by default.
+  - **Local repo path** — an absolute path; when set Claude may read & grep
+    files there (no writes, no shell) to cross-reference code.
+- On a **Featurebase** ticket a **merchant card** appears (auto-detected from the
+  `*.myshopify.com` on the page); hit **Draft reply** on it to draft a support
+  reply into the chat, or ↻ to re-detect. Compact tiles = option sets · designs ·
+  orders · shops; **click the card** to expand full details (contact + copy
+  email, plan / $ / MRR / activated / renewal, usage, credits, shop status).
+  On ordinary pages the card stays hidden.
 
 ## Merchant summary
 
@@ -109,16 +140,25 @@ error; the chat still works.
 
 ## Knobs
 
-- CLI flags: `native-host/host.js` → `claudeArgs()` / `CLIS`.
-- DOM tools: add/adjust in `native-host/mcp-server.js` (schema) and
-  `src/sidepanel/bridge.ts` → `domTool` (the code that runs in the page).
-- Tools are read-only by design. Adding write actions (click, type into the
-  reply box) is possible but intentionally omitted — that's the auto-reply path.
+- CLI flags & tool gating: `native-host/host.js` → `PROVIDERS.claude.buildArgs`
+  and the `PAGE_TOOLS` / `DEBUG_TOOLS` / `REPO_TOOLS` groups.
+- Browser tools: add/adjust the schema in `native-host/mcp-server.js` and the
+  page-side code in `src/sidepanel/bridge.ts` → `domTool`; then list the new
+  name in the right group in `host.js` so it's advertised + allowed.
+- Console/network capture (Chrome DevTools Protocol) lives in
+  `src/sidepanel/capture.ts`.
+- Write actions run **without confirmation** (agentic, by design). `Bash` /
+  `Edit` / `Write` stay disabled in `host.js` (`NO_BUILTIN_TOOLS`), so Claude
+  never mutates files or runs a shell — even with a repo path set.
 
 ## Troubleshooting
 
 - **"native host not reachable"** → re-run `install.sh` and fully restart Chrome.
-- **Tool call "timed out"** → the side panel must be open (it executes the DOM
-  tools); keep it open while Claude works.
+- **Tool call "timed out"** → the side panel must be open (it executes the
+  browser tools); keep it open while Claude works.
+- **Capture says "close DevTools on this tab"** → a tab allows only one debugger
+  client; close DevTools (or another debugging extension) on that tab. The
+  yellow "being debugged" banner is normal while capture is on; dismissing it
+  turns capture off.
 - **CLI spawns but errors** → PATH issue; re-run `install.sh` from the shell that
   can run `claude`/`codex`.
