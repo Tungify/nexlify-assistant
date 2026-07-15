@@ -434,7 +434,7 @@ export default function App() {
 
   // One turn. `seed` is an optional instruction prepended (Draft reply). A
   // reopened conversation replays its transcript as context on the next turn.
-  const submit = (seed?: string) => {
+  const submit = async (seed?: string) => {
     if (running) return;
     resetStream();
     const text = input.trim();
@@ -444,6 +444,22 @@ export default function App() {
       setStatus({ label: "type a message", tone: "warning" });
       return;
     }
+
+    // Seed the turn with the tab the user is looking at RIGHT NOW, so the model
+    // acts on the current tab and notices a tab switch — otherwise it keeps
+    // answering from a get_page it ran earlier on a tab that's no longer active.
+    // Injected into the sent prompt only (not the visible bubble).
+    let tabCtx = "";
+    if (pageOn) {
+      const tab = await bridgeRef.current?.activeTabInfo();
+      if (tab?.url) {
+        tabCtx =
+          `[Context: the user is currently viewing this browser tab — ${JSON.stringify(tab.title || "(untitled)")} ` +
+          `(${tab.url}). Act on THIS tab; call get_page/query_dom to read it when needed, and don't assume a tab ` +
+          `you read earlier is still the active one.]\n\n`;
+      }
+    }
+
     let prompt: string;
     if (replay) {
       prompt = buildReplayPrompt(messagesRef.current, seed ? `${seed}\n\n${text}` : text);
@@ -453,6 +469,7 @@ export default function App() {
     } else {
       prompt = seed ? [seed, text].filter(Boolean).join("\n\n") : text;
     }
+    prompt = tabCtx + prompt;
     const shown = text || (seed ? "Draft a reply to the open ticket" : "(continue)");
 
     setMessages((ms) => [...ms, { role: "user", text: shown }, { role: "assistant", text: "" }]);

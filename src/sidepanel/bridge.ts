@@ -457,6 +457,15 @@ export class Bridge {
     this.ensure()?.postMessage(req);
   }
 
+  // The tab the user is looking at RIGHT NOW (url + title). Seeded into each turn
+  // so the model always acts on the current tab and notices a tab switch, instead
+  // of trusting a get_page it ran earlier on a tab that's no longer active.
+  async activeTabInfo(): Promise<{ url: string; title: string } | null> {
+    const t = await activeTab();
+    if (!t) return null;
+    return { url: t.url || t.pendingUrl || "", title: t.title || "" };
+  }
+
   // Ask the host to spin up an idle CLI session now, so the next send() only
   // waits on the API instead of paying cold-start after the click.
   prewarm(cfg: SessionCfg) {
