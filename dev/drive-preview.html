@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Drive aura preview — Nexlify</title>
+<!--
+  Standalone preview of the "AI is driving this tab" aura overlay.
+  Source of truth: src/sidepanel/drive.ts  (function nexlifyDrive)
+
+  Everything here mirrors that code 1:1 so you can tweak the light aura + motes
+  live and paste the result straight back:
+    • box-shadow  → glow.style.boxShadow            (drive.ts, glow element)
+    • pulse       → @keyframes nexlifyGlow
+    • light motes → spawnMote() + MOTE_* consts + @keyframes nexlifyMote
+    • hint pill   → hint.style.background
+    • cursor      → SVG stroke
+    • click ping  → ping.style.border + nexlifyPing
+
+  Just open this file in a browser (double-click). Nothing to build.
+  Note: the real overlay also lays an invisible input-blocker over the page;
+  that's omitted here — this preview is purely about the *visuals*.
+-->
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    color: #0f172a; background: #eef2f7; overflow: hidden;
+  }
+
+  /* ---------------- mock web page (the tab being driven) ---------------- */
+  .mock { height: 100vh; overflow: auto; }
+  .mock-top {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 20px; background: #fff; border-bottom: 1px solid #e2e8f0;
+    position: sticky; top: 0; z-index: 1;
+  }
+  .mock-top .dot { width: 12px; height: 12px; border-radius: 999px; }
+  .mock-brand { font-weight: 700; letter-spacing: -.01em; margin-left: 4px; }
+  .mock-nav { margin-left: auto; display: flex; gap: 18px; color: #64748b; }
+  .mock-body { display: grid; grid-template-columns: 220px 1fr; }
+  .mock-side { padding: 20px; border-right: 1px solid #e2e8f0; min-height: calc(100vh - 57px); background:#f8fafc; }
+  .mock-side a { display: block; padding: 8px 12px; border-radius: 8px; color: #334155; text-decoration: none; margin-bottom: 4px; }
+  .mock-side a:hover { background: #eef2f7; }
+  .mock-main { padding: 28px 32px; }
+  .mock-main h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: -.02em; }
+  .mock-main p.sub { color: #64748b; margin: 0 0 24px; }
+  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 24px; }
+  .kpi { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 16px; }
+  .kpi .n { font-size: 26px; font-weight: 700; letter-spacing: -.02em; }
+  .kpi .l { color: #64748b; font-size: 12px; }
+  .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 20px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #eef2f7; }
+  th { color: #94a3b8; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+    border: 1px solid #cbd5e1; background: #fff; color: #334155;
+    padding: 8px 14px; border-radius: 10px; font-weight: 600; font-size: 13px;
+  }
+  .btn.primary { background: #4c1d95; border-color: #4c1d95; color: #fff; }
+  .row-actions { display: flex; gap: 10px; margin-top: 4px; }
+
+  /* ---------------- the driving overlay (mirrors drive.ts) ---------------- */
+  #driveRoot { position: fixed; inset: 0; z-index: 2147483647; pointer-events: none; }
+  #glow { position: absolute; inset: 0; pointer-events: none; }
+  #hint {
+    position: absolute; left: 50%; top: 14px; transform: translateX(-50%);
+    pointer-events: none; font: 600 12px/1.4 -apple-system, system-ui, sans-serif;
+    color: #fff; padding: 6px 12px; border-radius: 999px;
+    box-shadow: 0 4px 16px rgba(0,0,0,.3); white-space: nowrap; z-index: 3;
+  }
+  #cursor {
+    position: absolute; left: 0; top: 0; width: 24px; height: 24px;
+    pointer-events: none; transform: translate(-3px,-2px);
+    transition: left .35s cubic-bezier(.22,1,.36,1), top .35s cubic-bezier(.22,1,.36,1);
+    filter: drop-shadow(0 2px 3px rgba(0,0,0,.45)); opacity: 0; z-index: 2;
+  }
+  .ping {
+    position: absolute; width: 26px; height: 26px; margin-left: -13px; margin-top: -13px;
+    border-radius: 999px; border: 2px solid #a855f7; pointer-events: none;
+    animation: nexlifyPing .6s ease-out forwards; z-index: 1;
+  }
+  .mote { position: absolute; left: 0; top: 0; border-radius: 999px; pointer-events: none; opacity: 0; z-index: 1; }
+  @keyframes nexlifyPing { 0% { transform: scale(.4); opacity: .7 } 100% { transform: scale(2.6); opacity: 0 } }
+  @keyframes nexlifyMote {
+    0%   { opacity: 0; transform: translate(var(--sx), var(--sy)) scale(.4); }
+    12%  { opacity: 1; }
+    78%  { opacity: 1; }
+    100% { opacity: 0; transform: translate(var(--ex), var(--ey)) scale(1.2); }
+  }
+
+  /* ---------------- control panel ---------------- */
+  #panel {
+    position: fixed; top: 16px; right: 16px; width: 340px; max-height: calc(100vh - 32px);
+    overflow: auto; z-index: 2147483647; pointer-events: auto;
+    background: #0b1020; color: #e2e8f0; border: 1px solid #1e293b;
+    border-radius: 16px; box-shadow: 0 20px 60px rgba(2,6,23,.45); font-size: 13px;
+  }
+  #panel header {
+    display: flex; align-items: center; gap: 8px; padding: 14px 16px;
+    border-bottom: 1px solid #1e293b; position: sticky; top: 0; background: #0b1020;
+  }
+  #panel header .title { font-weight: 700; letter-spacing: -.01em; }
+  #panel header .spark { color: #a855f7; }
+  #panel header button {
+    margin-left: auto; background: transparent; border: 0; color: #94a3b8;
+    cursor: pointer; font-size: 18px; line-height: 1; padding: 2px 6px; border-radius: 6px;
+  }
+  #panel header button:hover { background: #1e293b; color: #e2e8f0; }
+  #panel .body { padding: 12px 16px 16px; }
+  #panel.collapsed .body { display: none; }
+
+  .group { margin-top: 14px; }
+  .group > .h {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #64748b;
+    font-weight: 700; margin: 0 0 8px; display: flex; align-items: center; gap: 6px;
+  }
+  .group > .h::after { content: ""; flex: 1; height: 1px; background: #1e293b; }
+  .ctl { display: grid; grid-template-columns: 92px 1fr auto; align-items: center; gap: 8px; margin: 7px 0; }
+  .ctl label { color: #cbd5e1; }
+  .ctl .val { color: #94a3b8; font-variant-numeric: tabular-nums; min-width: 40px; text-align: right; font-size: 12px; }
+  input[type=range] { width: 100%; accent-color: #a855f7; }
+  input[type=color] { width: 100%; height: 26px; padding: 0; border: 1px solid #1e293b; border-radius: 7px; background: #111827; cursor: pointer; }
+  input[type=text] { width: 100%; background: #111827; border: 1px solid #1e293b; color: #e2e8f0; border-radius: 8px; padding: 6px 9px; font-size: 12px; }
+  .toggles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .toggle { display: flex; align-items: center; gap: 8px; background: #111827; border: 1px solid #1e293b; border-radius: 9px; padding: 8px 10px; cursor: pointer; user-select: none; }
+  .toggle input { accent-color: #a855f7; }
+
+  .out { margin-top: 8px; }
+  .out .lbl { display: flex; align-items: center; gap: 8px; color: #94a3b8; font-size: 11px; margin: 10px 0 5px; }
+  .out .lbl button { margin-left: auto; background: #1e293b; border: 0; color: #cbd5e1; cursor: pointer; border-radius: 6px; padding: 3px 9px; font-size: 11px; font-weight: 600; }
+  .out .lbl button:hover { background: #334155; }
+  pre {
+    margin: 0; background: #05070f; border: 1px solid #1e293b; border-radius: 9px; padding: 10px;
+    overflow: auto; color: #cbd5e1; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .actions { display: flex; gap: 8px; margin-top: 14px; }
+  .actions button { flex: 1; background: #1e293b; border: 1px solid #334155; color: #e2e8f0; cursor: pointer; border-radius: 10px; padding: 9px; font-weight: 600; font-size: 12px; }
+  .actions button.accent { background: #4c1d95; border-color: #6d28d9; }
+  .actions button:hover { filter: brightness(1.12); }
+  .note { color: #64748b; font-size: 11px; line-height: 1.5; margin-top: 12px; }
+  .note code { color: #a5b4fc; background: #111827; padding: 1px 5px; border-radius: 5px; }
+</style>
+</head>
+<body>
+  <!-- glow pulse keyframes are rewritten from JS so min/max opacity stay live -->
+  <style id="glowKF"></style>
+
+  <!-- ============ mock page being "driven" ============ -->
+  <div class="mock">
+    <div class="mock-top">
+      <span class="dot" style="background:#f87171"></span>
+      <span class="dot" style="background:#fbbf24"></span>
+      <span class="dot" style="background:#34d399"></span>
+      <span class="mock-brand">Acme Console</span>
+      <nav class="mock-nav"><span>Overview</span><span>Reports</span><span>Settings</span></nav>
+    </div>
+    <div class="mock-body">
+      <aside class="mock-side">
+        <a href="#" class="target">Dashboard</a>
+        <a href="#" class="target">Customers</a>
+        <a href="#" class="target">Orders</a>
+        <a href="#" class="target">Products</a>
+        <a href="#" class="target">Analytics</a>
+      </aside>
+      <main class="mock-main">
+        <h1>Dashboard</h1>
+        <p class="sub">A neutral page so the driving aura reads in context.</p>
+        <div class="kpis">
+          <div class="kpi"><div class="n">1,284</div><div class="l">Sessions</div></div>
+          <div class="kpi"><div class="n">$8,940</div><div class="l">Revenue</div></div>
+          <div class="kpi"><div class="n">312</div><div class="l">Orders</div></div>
+          <div class="kpi"><div class="n">4.7%</div><div class="l">Conversion</div></div>
+        </div>
+        <div class="card">
+          <div class="row-actions">
+            <button class="btn primary target">New report</button>
+            <button class="btn target">Export</button>
+            <input class="btn target" style="min-width:180px" placeholder="Search…" />
+          </div>
+          <table style="margin-top:16px">
+            <thead><tr><th>Order</th><th>Customer</th><th>Status</th><th>Total</th></tr></thead>
+            <tbody>
+              <tr><td>#1041</td><td>Jordan Lee</td><td>Paid</td><td>$120.00</td></tr>
+              <tr><td>#1040</td><td>Sam Rivera</td><td>Pending</td><td>$54.00</td></tr>
+              <tr><td>#1039</td><td>Taylor Kim</td><td>Paid</td><td>$318.00</td></tr>
+              <tr><td>#1038</td><td>Casey Nguyen</td><td>Refunded</td><td>$0.00</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <!-- ============ the driving overlay ============ -->
+  <div id="driveRoot" aria-hidden="true">
+    <div id="glow"></div>
+    <div id="hint">✨ AI is controlling this tab — press Esc to take over</div>
+    <div id="cursor">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path id="cursorPath" d="M4 2l6 16 2.4-6.4L19 9 4 2z" fill="#fff" stroke="#7c3aed" stroke-width="1.5" stroke-linejoin="round"/>
+      </svg>
+    </div>
+  </div>
+
+  <!-- ============ control panel ============ -->
+  <div id="panel">
+    <header>
+      <span class="spark">✨</span>
+      <span class="title">Drive aura preview</span>
+      <button id="collapse" title="Collapse">–</button>
+    </header>
+    <div class="body">
+      <div class="toggles">
+        <label class="toggle"><input type="checkbox" data-key="on" data-kind="bool"> Overlay</label>
+        <label class="toggle"><input type="checkbox" data-key="anim" data-kind="bool"> Pulse</label>
+        <label class="toggle"><input type="checkbox" data-key="hint" data-kind="bool"> Hint pill</label>
+        <label class="toggle"><input type="checkbox" data-key="motesOn" data-kind="bool"> Light motes</label>
+        <label class="toggle"><input type="checkbox" data-key="demo" data-kind="bool"> Auto-demo</label>
+      </div>
+
+      <div class="group">
+        <p class="h">Rim (light edge)</p>
+        <div class="ctl"><label>Blur</label><input type="range" min="0" max="24" step="1" data-key="rimBlur"><span class="val"></span></div>
+        <div class="ctl"><label>Spread</label><input type="range" min="0" max="10" step="1" data-key="rimSpread"><span class="val"></span></div>
+        <div class="ctl"><label>Color</label><input type="color" data-key="rimC" data-kind="str"><span class="val"></span></div>
+        <div class="ctl"><label>Opacity</label><input type="range" min="0" max="1" step="0.01" data-key="rimA"><span class="val"></span></div>
+      </div>
+
+      <div class="group">
+        <p class="h">Inner glow</p>
+        <div class="ctl"><label>Blur</label><input type="range" min="0" max="120" step="1" data-key="innBlur"><span class="val"></span></div>
+        <div class="ctl"><label>Spread</label><input type="range" min="0" max="60" step="1" data-key="innSpread"><span class="val"></span></div>
+        <div class="ctl"><label>Color</label><input type="color" data-key="innC" data-kind="str"><span class="val"></span></div>
+        <div class="ctl"><label>Opacity</label><input type="range" min="0" max="1" step="0.01" data-key="innA"><span class="val"></span></div>
+      </div>
+
+      <div class="group">
+        <p class="h">Mid aura</p>
+        <div class="ctl"><label>Blur</label><input type="range" min="0" max="200" step="1" data-key="midBlur"><span class="val"></span></div>
+        <div class="ctl"><label>Spread</label><input type="range" min="0" max="80" step="1" data-key="midSpread"><span class="val"></span></div>
+        <div class="ctl"><label>Color</label><input type="color" data-key="midC" data-kind="str"><span class="val"></span></div>
+        <div class="ctl"><label>Opacity</label><input type="range" min="0" max="1" step="0.01" data-key="midA"><span class="val"></span></div>
+      </div>
+
+      <div class="group">
+        <p class="h">Bloom (wide bleed)</p>
+        <div class="ctl"><label>Blur</label><input type="range" min="0" max="320" step="2" data-key="bloomBlur"><span class="val"></span></div>
+        <div class="ctl"><label>Spread</label><input type="range" min="0" max="120" step="1" data-key="bloomSpread"><span class="val"></span></div>
+        <div class="ctl"><label>Color</label><input type="color" data-key="bloomC" data-kind="str"><span class="val"></span></div>
+        <div class="ctl"><label>Opacity</label><input type="range" min="0" max="1" step="0.01" data-key="bloomA"><span class="val"></span></div>
+      </div>
+
+      <div class="group">
+        <p class="h">Pulse</p>
+        <div class="ctl"><label>Duration</label><input type="range" min="0.3" max="5" step="0.1" data-key="dur"><span class="val"></span></div>
+        <div class="ctl"><label>Min opacity</label><input type="range" min="0" max="1" step="0.01" data-key="pMin"><span class="val"></span></div>
+        <div class="ctl"><label>Max opacity</label><input type="range" min="0" max="1" step="0.01" data-key="pMax"><span class="val"></span></div>
+      </div>
+
+      <div class="group">
+        <p class="h">Light motes</p>
+        <div class="ctl"><label>Rate (ms)</label><input type="range" min="60" max="700" step="10" data-key="moteRate"><span class="val"></span></div>
+        <div class="ctl"><label>Reach (px)</label><input type="range" min="40" max="320" step="5" data-key="moteReach"><span class="val"></span></div>
+        <div class="ctl"><label>Max size</label><input type="range" min="2" max="12" step="0.5" data-key="moteSize"><span class="val"></span></div>
+        <div class="ctl"><label>Speed (s)</label><input type="range" min="0.8" max="4" step="0.1" data-key="moteSpeed"><span class="val"></span></div>
+        <div class="ctl"><label>Color A</label><input type="color" data-key="moteA" data-kind="str"><span class="val"></span></div>
+        <div class="ctl"><label>Color B</label><input type="color" data-key="moteB" data-kind="str"><span class="val"></span></div>
+      </div>
+
+      <div class="group">
+        <p class="h">Extras</p>
+        <div class="ctl"><label>Hint bg</label><input type="color" data-key="hintC" data-kind="str"><span class="val"></span></div>
+        <div class="ctl"><label>Hint opacity</label><input type="range" min="0" max="1" step="0.01" data-key="hintA"><span class="val"></span></div>
+        <div class="ctl"><label>Cursor</label><input type="color" data-key="curC" data-kind="str"><span class="val"></span></div>
+        <div class="ctl"><label>Ping</label><input type="color" data-key="pingC" data-kind="str"><span class="val"></span></div>
+        <div class="ctl" style="grid-template-columns:92px 1fr"><label>Hint text</label><input type="text" data-key="hintText" data-kind="str"></div>
+      </div>
+
+      <div class="out">
+        <div class="lbl">box-shadow <span style="opacity:.6">→ drive.ts glow.style</span><button data-copy="out">Copy</button></div>
+        <pre id="out"></pre>
+        <div class="lbl">@keyframes nexlifyGlow<button data-copy="outKf">Copy</button></div>
+        <pre id="outKf"></pre>
+        <div class="lbl">mote consts <span style="opacity:.6">→ drive.ts MOTE_*</span><button data-copy="outMote">Copy</button></div>
+        <pre id="outMote"></pre>
+      </div>
+
+      <div class="actions">
+        <button class="accent" id="simulate">Simulate AI action</button>
+        <button id="reset">Reset to code defaults</button>
+      </div>
+
+      <p class="note">
+        Mirrors <code>src/sidepanel/drive.ts</code>. Tweak here, then paste the
+        snippets back into <code>nexlifyDrive()</code>. The invisible input-blocker
+        from the real overlay is omitted so the controls stay clickable.
+      </p>
+    </div>
+  </div>
+
+<script>
+  // Defaults are the exact values from src/sidepanel/drive.ts.
+  const defaults = {
+    on: true, anim: true, hint: true, motesOn: true, demo: false,
+    // 4-layer luminous aura
+    rimBlur: 3,   rimSpread: 1,  rimC: "#fff4cc", rimA: 0.9,
+    innBlur: 34,  innSpread: 6,  innC: "#fcd34d", innA: 0.6,
+    midBlur: 92,  midSpread: 22, midC: "#f59e0b", midA: 0.32,
+    bloomBlur: 200, bloomSpread: 60, bloomC: "#f59e0b", bloomA: 0.2,
+    // pulse
+    dur: 1.8, pMin: 0.6, pMax: 0.95,
+    // motes
+    moteRate: 150, moteReach: 200, moteSize: 7, moteSpeed: 2.2,
+    moteA: "#ffecaa", moteB: "#fbbf24",
+    // extras
+    hintText: "✨ AI is controlling this tab — press Esc to take over",
+    hintC: "#78350f", hintA: 0.92, curC: "#b45309", pingC: "#fbbf24",
+  };
+  let S = { ...defaults };
+
+  const el = {
+    root: document.getElementById("driveRoot"),
+    glow: document.getElementById("glow"),
+    hint: document.getElementById("hint"),
+    cursor: document.getElementById("cursor"),
+    cursorPath: document.getElementById("cursorPath"),
+    kf: document.getElementById("glowKF"),
+    out: document.getElementById("out"),
+    outKf: document.getElementById("outKf"),
+    outMote: document.getElementById("outMote"),
+  };
+
+  // Format alpha the way drive.ts writes it: .9, .22, .92, 1
+  function fmtA(a) {
+    let s = (Math.round(a * 100) / 100).toString();
+    if (s.startsWith("0.")) s = s.slice(1);
+    return s;
+  }
+  function hexToRgb(hex) {
+    hex = hex.replace("#", "");
+    if (hex.length === 3) hex = hex.split("").map((c) => c + c).join("");
+    const n = parseInt(hex, 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  function rgbStr(hex) { const [r, g, b] = hexToRgb(hex); return `${r},${g},${b}`; }
+  function rgba(hex, a) { return `rgba(${rgbStr(hex)},${fmtA(a)})`; }
+
+  function boxShadow() {
+    return (
+      `inset 0 0 ${S.rimBlur}px ${S.rimSpread}px ${rgba(S.rimC, S.rimA)}, ` +
+      `inset 0 0 ${S.innBlur}px ${S.innSpread}px ${rgba(S.innC, S.innA)}, ` +
+      `inset 0 0 ${S.midBlur}px ${S.midSpread}px ${rgba(S.midC, S.midA)}, ` +
+      `inset 0 0 ${S.bloomBlur}px ${S.bloomSpread}px ${rgba(S.bloomC, S.bloomA)}`
+    );
+  }
+  function keyframes() {
+    return `@keyframes nexlifyGlow{0%,100%{opacity:${fmtA(S.pMax)}}50%{opacity:${fmtA(S.pMin)}}}`;
+  }
+
+  function apply() {
+    const bs = boxShadow();
+    el.glow.style.boxShadow = bs;
+    el.kf.textContent = keyframes();
+    el.glow.style.animation = S.anim ? `nexlifyGlow ${S.dur}s ease-in-out infinite` : "none";
+    el.root.style.display = S.on ? "" : "none";
+    el.hint.style.display = S.hint ? "" : "none";
+    el.hint.textContent = S.hintText;
+    el.hint.style.background = rgba(S.hintC, S.hintA);
+    el.cursorPath.setAttribute("stroke", S.curC);
+
+    // paste-ready snippets for drive.ts
+    el.out.textContent = `boxShadow:\n  "${bs}",`;
+    el.outKf.textContent = `"${keyframes()}"`;
+    el.outMote.textContent =
+      `const MOTE_RATE = ${S.moteRate};\n` +
+      `const MOTE_REACH = ${S.moteReach};\n` +
+      `const MOTE_SIZE = ${S.moteSize};\n` +
+      `const MOTE_SPEED = ${S.moteSpeed};\n` +
+      `const MOTE_A = "${rgbStr(S.moteA)}";\n` +
+      `const MOTE_B = "${rgbStr(S.moteB)}";`;
+  }
+
+  // ---- light motes (mirrors drive.ts spawnMote) ----------------------------
+  let moteTimer = null;
+  function spawnMote() {
+    if (!S.motesOn || !S.on) return;
+    const W = window.innerWidth, H = window.innerHeight;
+    const edge = Math.floor(Math.random() * 4);
+    const dist = S.moteReach * (0.5 + Math.random() * 0.5);
+    const drift = (Math.random() - 0.5) * 80;
+    let sx, sy, ex, ey;
+    if (edge === 0) { sx = Math.random() * W; sy = -20; ex = sx + drift; ey = sy + dist; }
+    else if (edge === 1) { sx = Math.random() * W; sy = H + 20; ex = sx + drift; ey = sy - dist; }
+    else if (edge === 2) { sx = -20; sy = Math.random() * H; ex = sx + dist; ey = sy + drift; }
+    else { sx = W + 20; sy = Math.random() * H; ex = sx - dist; ey = sy + drift; }
+    const size = 2 + Math.random() * (S.moteSize - 2);
+    const dur = S.moteSpeed * (0.7 + Math.random() * 0.7);
+    const hue = Math.random() < 0.5 ? rgbStr(S.moteA) : rgbStr(S.moteB);
+    const m = document.createElement("div");
+    m.className = "mote";
+    m.style.width = m.style.height = size + "px";
+    m.style.background = `radial-gradient(circle, #fff 0%, rgba(${hue},.95) 45%, rgba(${hue},0) 72%)`;
+    m.style.boxShadow = `0 0 ${8 + size * 1.5}px ${size}px rgba(${hue},.9)`;
+    m.style.setProperty("--sx", sx + "px");
+    m.style.setProperty("--sy", sy + "px");
+    m.style.setProperty("--ex", ex + "px");
+    m.style.setProperty("--ey", ey + "px");
+    m.style.animation = `nexlifyMote ${dur}s ease-out forwards`;
+    el.root.appendChild(m);
+    setTimeout(() => m.remove(), dur * 1000 + 120);
+  }
+  function restartMotes() {
+    if (moteTimer) { clearInterval(moteTimer); moteTimer = null; }
+    if (S.motesOn) {
+      moteTimer = setInterval(() => {
+        spawnMote();
+        spawnMote();
+        if (Math.random() < 0.5) spawnMote();
+      }, S.moteRate);
+    }
+  }
+
+  // ---- wire controls -------------------------------------------------------
+  function initInputs() {
+    document.querySelectorAll("[data-key]").forEach((inp) => {
+      const k = inp.dataset.key;
+      if (inp.type === "checkbox") inp.checked = !!S[k];
+      else inp.value = S[k];
+      const lab = inp.closest(".ctl")?.querySelector(".val");
+      if (lab) lab.textContent = S[k];
+    });
+  }
+  document.querySelectorAll("[data-key]").forEach((inp) => {
+    inp.addEventListener("input", () => {
+      const k = inp.dataset.key;
+      const kind = inp.dataset.kind || "num";
+      let v = inp.type === "checkbox" ? inp.checked : inp.value;
+      if (kind === "num") v = parseFloat(v);
+      S[k] = v;
+      const lab = inp.closest(".ctl")?.querySelector(".val");
+      if (lab) lab.textContent = v;
+      if (k === "demo") toggleDemo(v);
+      if (k === "motesOn" || k === "moteRate") restartMotes();
+      apply();
+    });
+  });
+
+  // ---- copy buttons --------------------------------------------------------
+  document.querySelectorAll("[data-copy]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const text = document.getElementById(btn.dataset.copy).textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        const old = btn.textContent;
+        btn.textContent = "Copied ✓";
+        setTimeout(() => (btn.textContent = old), 1200);
+      });
+    });
+  });
+
+  // ---- cursor + ping demo (mirrors bridge.startDrive → drive.cursor) --------
+  function ping(x, y) {
+    const p = document.createElement("div");
+    p.className = "ping";
+    p.style.left = x + "px";
+    p.style.top = y + "px";
+    p.style.borderColor = S.pingC;
+    el.root.appendChild(p);
+    setTimeout(() => p.remove(), 680);
+  }
+  function moveTo(target, click) {
+    const r = target.getBoundingClientRect();
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    el.cursor.style.opacity = "1";
+    el.cursor.style.left = x + "px";
+    el.cursor.style.top = y + "px";
+    if (click) setTimeout(() => ping(x, y), 340);
+  }
+  const targets = Array.from(document.querySelectorAll(".target"));
+  let ti = 0;
+  function nextAction() {
+    if (!targets.length) return;
+    moveTo(targets[ti % targets.length], true);
+    ti++;
+  }
+  document.getElementById("simulate").addEventListener("click", nextAction);
+
+  let demoTimer = null;
+  function toggleDemo(on) {
+    if (on) { nextAction(); demoTimer = setInterval(nextAction, 2200); }
+    else if (demoTimer) { clearInterval(demoTimer); demoTimer = null; }
+  }
+
+  // ---- reset + collapse ----------------------------------------------------
+  document.getElementById("reset").addEventListener("click", () => {
+    const wasDemo = S.demo;
+    S = { ...defaults };
+    if (wasDemo) toggleDemo(false);
+    initInputs();
+    restartMotes();
+    apply();
+  });
+  const panel = document.getElementById("panel");
+  document.getElementById("collapse").addEventListener("click", (e) => {
+    panel.classList.toggle("collapsed");
+    e.target.textContent = panel.classList.contains("collapsed") ? "+" : "–";
+  });
+
+  // ---- go ------------------------------------------------------------------
+  initInputs();
+  restartMotes();
+  apply();
+</script>
+</body>
+</html>

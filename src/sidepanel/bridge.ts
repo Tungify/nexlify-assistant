@@ -28,7 +28,7 @@ const FB_HOST = "featurebase.app";
 
 // True when `url` points at a Featurebase page (see FB_HOST). Pure/sync so it
 // can gate work before we touch the tab.
-function isFeaturebaseUrl(url: string | undefined): boolean {
+export function isFeaturebaseUrl(url: string | undefined): boolean {
   if (!url) return false;
   try {
     const host = new URL(url).hostname;
@@ -55,7 +55,20 @@ export interface SessionCfg {
   repoPath: string;
   model: string;
   effort: string;
+  mcpTeam: boolean; // inherit the user's own claude MCP servers into the panel
+  mcpAllow: string[]; // read tools/servers to auto-run; others go through the popup
 }
+
+// A tool call the CLI wants approved (team-MCP mode: anything not auto-allowed).
+// The panel shows an allow/deny popup and answers with the CLI-expected shape.
+export interface PermissionAsk {
+  toolName: string;
+  input: Record<string, unknown>;
+  toolUseId?: string;
+}
+export type PermissionDecision =
+  | { behavior: "allow"; updatedInput: Record<string, unknown> }
+  | { behavior: "deny"; message: string };
 
 export type HostEvent =
   | { type: "chunk"; id: number; data: string }
@@ -361,30 +374,78 @@ async function activeTabId(): Promise<number | undefined> {
   return tab?.id;
 }
 
-// Scrape the merchant's myshopify domain from the open Featurebase ticket. The
-// app signs it into the Featurebase identity as company.website, so it appears
-// on the ticket — a regex over the page is selector-independent and robust.
-// True when the active tab is a Featurebase page. The panel gates the merchant
-// card on this so it never shows on ordinary tabs.
+// True when the active tab is a Featurebase page.
 export async function isFeaturebasePage(): Promise<boolean> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return isFeaturebaseUrl(tab?.url);
 }
 
+// Find the merchant's myshopify domain on the active tab. Two sources, so the
+// card works both in the support inbox and while browsing the merchant's store:
+//   • Featurebase ticket — the app signs the shop into the Featurebase identity
+//     as company.website, so a regex over the page text finds it (isolated world,
+//     selector-independent and robust).
+//   • Shopify storefront — read window.Shopify.shop, which holds the canonical
+//     xxx.myshopify.com even when the store runs on a CUSTOM domain. That global
+//     lives in the page's MAIN world, so we inject there. A non-Shopify page has
+//     no window.Shopify and no Shopify assets → we return "" and the card stays
+//     hidden (it never shows on ordinary pages).
+// executeScript throws on restricted URLs (chrome://, web store, …) — guard it.
 export async function readShopDomain(): Promise<string> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  // The shop domain comes off the open Featurebase ticket — off Featurebase
-  // there's nothing to read, so report "no shop" and don't inject a script.
-  if (!tab?.id || !isFeaturebaseUrl(tab.url)) return "";
-  const [res] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: () => {
-      const hay = `${document.body?.innerText ?? ""}\n${document.body?.innerHTML ?? ""}`;
-      const m = hay.match(/\b[a-z0-9][a-z0-9-]*\.myshopify\.com\b/i);
-      return m ? m[0].toLowerCase() : "";
-    },
-  });
-  return (res?.result as string) ?? "";
+  if (!tab?.id || !/^https?:/i.test(tab.url ?? "")) return "";
+
+  if (isFeaturebaseUrl(tab.url)) {
+    try {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => {
+          const hay = `${document.body?.innerText ?? ""}\n${document.body?.innerHTML ?? ""}`;
+          const m = hay.match(/\b[a-z0-9][a-z0-9-]*\.myshopify\.com\b/i);
+          return m ? m[0].toLowerCase() : "";
+        },
+      });
+      return (res?.result as string) ?? "";
+    } catch {
+      return "";
+    }
+  }
+
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: "MAIN", // window.Shopify lives in the page's main world
+      func: () => {
+        const norm = (s: unknown) => (typeof s === "string" ? s.toLowerCase() : "");
+        try {
+          const S = (window as unknown as { Shopify?: { shop?: string } }).Shopify;
+          if (S && typeof S.shop === "string" && /\.myshopify\.com$/i.test(S.shop)) return norm(S.shop);
+        } catch {
+          /* window.Shopify not readable */
+        }
+        // Custom-domain store whose window.Shopify isn't populated: only trust a
+        // myshopify match when the page is unmistakably a Shopify storefront.
+        try {
+          const html = document.documentElement?.innerHTML ?? "";
+          const isShopify =
+            /cdn\.shopify\.com|\/cdn\/shop\/|shopify-features|Shopify\.theme/i.test(html) ||
+            !!document.querySelector(
+              'meta[name="shopify-digital-wallet"], meta[name="shopify-checkout-api-token"], link[href*="cdn.shopify.com"]',
+            );
+          if (!isShopify) return "";
+          const m =
+            html.match(/Shopify\.shop\s*=\s*["']([a-z0-9][a-z0-9-]*\.myshopify\.com)["']/i) ||
+            html.match(/([a-z0-9][a-z0-9-]*\.myshopify\.com)/i);
+          return m ? norm(m[1]) : "";
+        } catch {
+          return "";
+        }
+      },
+    });
+    return (res?.result as string) ?? "";
+  } catch {
+    return "";
+  }
 }
 
 export class Bridge {
@@ -399,6 +460,9 @@ export class Bridge {
   constructor(
     private onEvent: (e: HostEvent) => void,
     onCaptureStatus?: (s: CaptureStatus) => void,
+    // Called when the CLI wants to run a tool that isn't auto-allowed (team-MCP
+    // mode): the panel shows an allow/deny popup and we relay the answer back.
+    private onPermission?: (ask: PermissionAsk) => Promise<PermissionDecision>,
   ) {
     this.capture = new Capture(onCaptureStatus);
   }
@@ -517,7 +581,13 @@ export class Bridge {
   private async runTool(req: ToolRequest) {
     try {
       let data: unknown;
-      if (DEBUG_TOOLS.has(req.tool)) {
+      if (req.tool === "permission_request") {
+        // Team-MCP mode: approve/deny a not-auto-allowed tool call in the panel.
+        const a = (req.args ?? {}) as { tool_name?: string; input?: Record<string, unknown>; tool_use_id?: string };
+        data = this.onPermission
+          ? await this.onPermission({ toolName: a.tool_name ?? "", input: a.input ?? {}, toolUseId: a.tool_use_id })
+          : ({ behavior: "deny", message: "No approver available" } as PermissionDecision);
+      } else if (DEBUG_TOOLS.has(req.tool)) {
         // Capture is "AI decides": the CDP debugger attaches lazily the first
         // time the assistant actually reads the buffer (that's when Chrome's
         // "being debugged" banner appears), not eagerly from a settings toggle.

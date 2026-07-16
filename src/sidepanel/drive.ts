@@ -28,6 +28,7 @@ export function nexlifyDrive(cmd: DriveCmd): void {
     const st = w.__nexlifyDrive;
     if (st) {
       try {
+        if (st.moteTimer) clearInterval(st.moteTimer);
         for (const [type, fn, opt] of st.listeners) doc.removeEventListener(type, fn, opt);
         st.root.remove();
       } catch {}
@@ -59,8 +60,10 @@ export function nexlifyDrive(cmd: DriveCmd): void {
       position: "absolute",
       inset: "0",
       pointerEvents: "none",
+      // Layered golden aura: bright warm-white rim → gold inner glow → amber mid
+      // aura → wide amber bloom. Reads as light, not a hard border.
       boxShadow:
-        "inset 0 0 0 3px rgba(139,92,246,.9), inset 0 0 40px 10px rgba(139,92,246,.4), inset 0 0 130px 26px rgba(56,189,248,.22)",
+        "inset 0 0 3px 1px rgba(255,244,204,.9), inset 0 0 34px 6px rgba(252,211,77,.6), inset 0 0 92px 22px rgba(245,158,11,.32), inset 0 0 200px 60px rgba(245,158,11,.2)",
       animation: "nexlifyGlow 1.8s ease-in-out infinite",
     });
 
@@ -85,11 +88,12 @@ export function nexlifyDrive(cmd: DriveCmd): void {
       pointerEvents: "none",
       font: "600 12px/1.4 -apple-system, system-ui, sans-serif",
       color: "#fff",
-      background: "rgba(76,29,149,.92)",
+      background: "rgba(120,53,15,.92)",
       padding: "6px 12px",
       borderRadius: "999px",
       boxShadow: "0 4px 16px rgba(0,0,0,.3)",
       whiteSpace: "nowrap",
+      zIndex: "3",
     });
 
     const cursor = doc.createElement("div");
@@ -108,12 +112,14 @@ export function nexlifyDrive(cmd: DriveCmd): void {
     });
     cursor.innerHTML =
       "<svg width='24' height='24' viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'>" +
-      "<path d='M4 2l6 16 2.4-6.4L19 9 4 2z' fill='#fff' stroke='#7c3aed' stroke-width='1.5' stroke-linejoin='round'/></svg>";
+      "<path d='M4 2l6 16 2.4-6.4L19 9 4 2z' fill='#fff' stroke='#b45309' stroke-width='1.5' stroke-linejoin='round'/></svg>";
 
     const style = doc.createElement("style");
     style.textContent =
-      "@keyframes nexlifyGlow{0%,100%{opacity:.9}50%{opacity:.5}}" +
-      "@keyframes nexlifyPing{0%{transform:scale(.4);opacity:.7}100%{transform:scale(2.6);opacity:0}}";
+      "@keyframes nexlifyGlow{0%,100%{opacity:.95}50%{opacity:.6}}" +
+      "@keyframes nexlifyPing{0%{transform:scale(.4);opacity:.7}100%{transform:scale(2.6);opacity:0}}" +
+      "@keyframes nexlifyMote{0%{opacity:0;transform:translate(var(--sx),var(--sy)) scale(.4)}" +
+      "12%{opacity:1}78%{opacity:1}100%{opacity:0;transform:translate(var(--ex),var(--ey)) scale(1.2)}}";
 
     root.append(style, glow, blocker, hint, cursor);
     doc.documentElement.appendChild(root);
@@ -149,7 +155,59 @@ export function nexlifyDrive(cmd: DriveCmd): void {
     add("touchmove", swallow, { capture: true, passive: false });
     add("keydown", onKey, true);
 
-    st = w.__nexlifyDrive = { root, glow, blocker, hint, cursor, listeners };
+    // Light motes: glowing specks drift in from a random edge, cross the aura
+    // band a short way, then fade — the "hào quang" shimmer. Tune these with
+    // dev/drive-preview.html, then copy the values back here.
+    const MOTE_RATE = 150; // ms between spawns
+    const MOTE_REACH = 200; // max px travelled inward
+    const MOTE_SIZE = 7; // max mote diameter (px)
+    const MOTE_SPEED = 2.2; // base seconds to cross + fade
+    const MOTE_A = "255,236,170"; // pale gold
+    const MOTE_B = "251,191,36"; // amber
+    const spawnMote = () => {
+      if (!doc.documentElement.contains(root) || root.style.display === "none") return;
+      const W = window.innerWidth;
+      const H = window.innerHeight;
+      const edge = Math.floor(Math.random() * 4);
+      const dist = MOTE_REACH * (0.5 + Math.random() * 0.5);
+      const drift = (Math.random() - 0.5) * 80;
+      let sx: number, sy: number, ex: number, ey: number;
+      if (edge === 0) { sx = Math.random() * W; sy = -20; ex = sx + drift; ey = sy + dist; }
+      else if (edge === 1) { sx = Math.random() * W; sy = H + 20; ex = sx + drift; ey = sy - dist; }
+      else if (edge === 2) { sx = -20; sy = Math.random() * H; ex = sx + dist; ey = sy + drift; }
+      else { sx = W + 20; sy = Math.random() * H; ex = sx - dist; ey = sy + drift; }
+      const size = 2 + Math.random() * (MOTE_SIZE - 2);
+      const dur = MOTE_SPEED * (0.7 + Math.random() * 0.7);
+      const hue = Math.random() < 0.5 ? MOTE_A : MOTE_B;
+      const m = doc.createElement("div");
+      Object.assign(m.style, {
+        position: "absolute",
+        left: "0",
+        top: "0",
+        width: size + "px",
+        height: size + "px",
+        borderRadius: "999px",
+        pointerEvents: "none",
+        opacity: "0",
+        zIndex: "1",
+        background: `radial-gradient(circle, #fff 0%, rgba(${hue},.95) 45%, rgba(${hue},0) 72%)`,
+        boxShadow: `0 0 ${8 + size * 1.5}px ${size}px rgba(${hue},.9)`,
+      });
+      m.style.setProperty("--sx", sx + "px");
+      m.style.setProperty("--sy", sy + "px");
+      m.style.setProperty("--ex", ex + "px");
+      m.style.setProperty("--ey", ey + "px");
+      m.style.animation = `nexlifyMote ${dur}s ease-out forwards`;
+      root.appendChild(m);
+      setTimeout(() => m.remove(), dur * 1000 + 120);
+    };
+    const moteTimer = setInterval(() => {
+      spawnMote();
+      spawnMote();
+      if (Math.random() < 0.5) spawnMote(); // denser field so the motes read clearly
+    }, MOTE_RATE);
+
+    st = w.__nexlifyDrive = { root, glow, blocker, hint, cursor, listeners, moteTimer };
   }
 
   if (cmd.action === "hide") {
@@ -187,7 +245,7 @@ export function nexlifyDrive(cmd: DriveCmd): void {
           marginLeft: "-13px",
           marginTop: "-13px",
           borderRadius: "999px",
-          border: "2px solid #a855f7",
+          border: "2px solid #fbbf24",
           pointerEvents: "none",
           animation: "nexlifyPing .6s ease-out forwards",
           zIndex: "1",

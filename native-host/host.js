@@ -170,13 +170,15 @@ const REPO_TOOLS = ["Read", "Grep", "Glob"];
 // Never let Claude mutate the machine: no shell, no file writes.
 const NO_BUILTIN_TOOLS = "Bash,Edit,Write,MultiEdit,NotebookEdit";
 
-function bridgeConfig(toolNames) {
+function bridgeConfig(toolNames, permission) {
+  const env = { FB_BRIDGE_SOCK: SOCK, FB_TOOLS: toolNames.join(",") };
+  if (permission) env.FB_PERMISSION_TOOL = "1"; // advertise permission_request
   return JSON.stringify({
     mcpServers: {
       fbbridge: {
         command: process.execPath,
         args: [MCP_SERVER],
-        env: { FB_BRIDGE_SOCK: SOCK, FB_TOOLS: toolNames.join(",") },
+        env,
       },
     },
   });
@@ -199,6 +201,7 @@ function validRepo(p) {
 function sessionCfg(msg) {
   const provider = PROVIDERS[msg.cli];
   const canTools = !!(provider && provider.supportsTools);
+  const mcpTeam = canTools && !!msg.mcpTeam;
   return {
     page: canTools && !!msg.page,
     tabs: canTools && !!msg.tabs,
@@ -206,6 +209,10 @@ function sessionCfg(msg) {
     repoPath: validRepo(msg.repoPath),
     model: msg.model || "",
     effort: msg.effort || "",
+    // Team-MCP mode: inherit the user's own claude MCP servers; auto-run only the
+    // read tools/servers they listed, everything else goes through the popup.
+    mcpTeam,
+    mcpAllow: mcpTeam && Array.isArray(msg.mcpAllow) ? msg.mcpAllow.map((s) => String(s).trim()).filter(Boolean) : [],
   };
 }
 
@@ -214,7 +221,7 @@ const PROVIDERS = {
     cmd: process.env.CLAUDE_BIN || "claude",
     format: "claude-stream-json",
     supportsTools: true,
-    buildArgs({ page, tabs, capture, repoPath, model, effort }) {
+    buildArgs({ page, tabs, capture, repoPath, model, effort, mcpTeam, mcpAllow }) {
       const a = [
         "-p",
         "--input-format",
@@ -225,8 +232,12 @@ const PROVIDERS = {
         "--verbose",
         "--disallowedTools",
         NO_BUILTIN_TOOLS,
-        "--strict-mcp-config",
       ];
+      // Off (default): keep the browser bridge isolated — only our fbbridge tools
+      // exist. Team-MCP mode: drop strict so the CLI ALSO loads the user's own
+      // configured MCP servers (Sentry/ClickUp/Postgres/…), and gate any tool not
+      // in --allowedTools behind an in-panel approval via permission_request.
+      if (!mcpTeam) a.push("--strict-mcp-config");
       if (model) a.push("--model", model);
       if (effort) a.push("--effort", effort);
       const bridgeTools = [];
@@ -235,7 +246,13 @@ const PROVIDERS = {
       if (capture) bridgeTools.push(...DEBUG_TOOLS);
       const allowed = bridgeTools.map((n) => "mcp__fbbridge__" + n);
       if (repoPath) allowed.push(...REPO_TOOLS); // cwd is set to the repo in spawnSession
-      if (bridgeTools.length) a.push("--mcp-config", bridgeConfig(bridgeTools));
+      if (mcpTeam) {
+        // The gate itself must auto-run (else it'd recurse), plus the read-only
+        // tools/servers the user marked auto-run; everything else hits the popup.
+        allowed.push("mcp__fbbridge__permission_request", ...(mcpAllow || []));
+        a.push("--permission-prompt-tool", "mcp__fbbridge__permission_request");
+      }
+      if (bridgeTools.length || mcpTeam) a.push("--mcp-config", bridgeConfig(bridgeTools, mcpTeam));
       else a.push("--mcp-config", '{"mcpServers":{}}');
       if (allowed.length) a.push("--allowedTools", allowed.join(","));
       return a;
@@ -290,7 +307,7 @@ function emitStreamLine(id, line) {
 // effort, and whether the DOM tools (and thus MCP) are wired in.
 function cfgKey(msg) {
   const c = sessionCfg(msg);
-  return JSON.stringify({ cli: msg.cli, page: c.page, tabs: c.tabs, capture: c.capture, repoPath: c.repoPath, model: c.model, effort: c.effort });
+  return JSON.stringify({ cli: msg.cli, page: c.page, tabs: c.tabs, capture: c.capture, repoPath: c.repoPath, model: c.model, effort: c.effort, mcpTeam: c.mcpTeam, mcpAllow: c.mcpAllow });
 }
 
 // Spawn an idle stream-json session for this config. The user turn arrives

@@ -19,13 +19,23 @@ import {
   Plus,
   RefreshCw,
   Settings2,
+  ShieldAlert,
   ShoppingBag,
   Sparkles,
   Square,
   Store,
   Trash2,
 } from "lucide-react";
-import { Bridge, isFeaturebasePage, readShopDomain, type Cli, type HostEvent, type ShopSummary } from "./bridge";
+import {
+  Bridge,
+  isFeaturebaseUrl,
+  readShopDomain,
+  type Cli,
+  type HostEvent,
+  type PermissionAsk,
+  type PermissionDecision,
+  type ShopSummary,
+} from "./bridge";
 import { type CaptureStatus } from "./capture";
 import { APP_NAME, DRAFT_REPLY_INSTRUCTION, GENERAL_PREAMBLE } from "./tools";
 import {
@@ -137,6 +147,12 @@ export default function App() {
   useEffect(() => void localStorage.setItem("fb_capture_on", captureOn ? "1" : "0"), [captureOn]);
   useEffect(() => void localStorage.setItem("fb_tabs_on", tabsOn ? "1" : "0"), [tabsOn]);
   useEffect(() => void localStorage.setItem("fb_repo_path", repoPath), [repoPath]);
+  // Team-MCP mode: expose the user's own claude MCP servers to the panel AI;
+  // tools/servers listed in mcpAllowText auto-run, anything else asks via a popup.
+  const [mcpTeam, setMcpTeam] = useState(() => localStorage.getItem("fb_mcp_team") === "1");
+  const [mcpAllowText, setMcpAllowText] = useState(() => localStorage.getItem("fb_mcp_allow") ?? "");
+  useEffect(() => void localStorage.setItem("fb_mcp_team", mcpTeam ? "1" : "0"), [mcpTeam]);
+  useEffect(() => void localStorage.setItem("fb_mcp_allow", mcpAllowText), [mcpAllowText]);
 
   // conversation
   const [messages, setMessages] = useState<Msg[]>([]);
@@ -149,12 +165,18 @@ export default function App() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyList, setHistoryList] = useState<Conversation[]>([]);
 
-  // merchant summary card — contextual: only shown when a shop is detected on
-  // the current page (Featurebase ticket), hidden on ordinary pages.
+  // merchant summary card — contextual: shown when a shop is detected on the
+  // page (a Featurebase ticket, or a Shopify storefront incl. custom domains),
+  // hidden on ordinary pages.
   const [summary, setSummary] = useState<ShopSummary | null>(null);
   const [summaryState, setSummaryState] = useState<"loading" | "idle" | "error">("loading");
   const [summaryErr, setSummaryErr] = useState<string | undefined>();
   const [shopDetected, setShopDetected] = useState(false);
+  // Whether the detected context is a Featurebase ticket (vs a Shopify
+  // storefront) — gates the ticket-only "Draft reply" action on the card.
+  const [onFb, setOnFb] = useState(false);
+  // Pending tool-approval popup (team-MCP mode: a not-auto-allowed tool call).
+  const [permAsk, setPermAsk] = useState<{ ask: PermissionAsk; resolve: (d: PermissionDecision) => void } | null>(null);
 
   const bridgeRef = useRef<Bridge | null>(null);
   const reqIdRef = useRef(0);
@@ -175,6 +197,9 @@ export default function App() {
   messagesRef.current = messages;
   const convIdRef = useRef<string | null>(null);
   const replayPendingRef = useRef(false);
+  // Mirrors `merchantConfigured` so the async shop-detection callbacks read the
+  // latest value without needing to be re-created on every settings change.
+  const merchantConfiguredRef = useRef(false);
   const cli: Cli = "claude";
 
   const buildCfg = () => ({
@@ -185,6 +210,8 @@ export default function App() {
     repoPath: repoPath.trim(),
     model,
     effort,
+    mcpTeam,
+    mcpAllow: mcpTeam ? mcpAllowText.split(/[\s,]+/).filter(Boolean) : [],
   });
 
   // Pop the OS folder picker (via the native host) and fill in the repo path.
@@ -303,7 +330,11 @@ export default function App() {
     // Just mirror the capture status. Dismissing the debugger banner detaches
     // the CDP session, but we no longer revoke the permission — the assistant
     // re-attaches on-demand the next time it reads console/network.
-    const b = new Bridge(onEvent, (s) => setCaptureStatus(s));
+    const b = new Bridge(
+      onEvent,
+      (s) => setCaptureStatus(s),
+      (ask) => new Promise<PermissionDecision>((resolve) => setPermAsk({ ask, resolve })),
+    );
     b.connect();
     bridgeRef.current = b;
     return () => {
@@ -323,8 +354,11 @@ export default function App() {
   // Keep a prewarmed session matching the current settings so the first turn of
   // the next conversation only waits on the API, not cold-start.
   useEffect(() => {
-    bridgeRef.current?.prewarm({ cli, page: pageOn, tabs: tabsOn, capture: captureOn, repoPath: repoPath.trim(), model, effort });
-  }, [cli, pageOn, tabsOn, captureOn, repoPath, model, effort]);
+    bridgeRef.current?.prewarm({
+      cli, page: pageOn, tabs: tabsOn, capture: captureOn, repoPath: repoPath.trim(), model, effort,
+      mcpTeam, mcpAllow: mcpTeam ? mcpAllowText.split(/[\s,]+/).filter(Boolean) : [],
+    });
+  }, [cli, pageOn, tabsOn, captureOn, repoPath, model, effort, mcpTeam, mcpAllowText]);
 
   // Capture is "AI decides": the CDP debugger attaches on-demand when the
   // assistant first reads console/network (see bridge.runTool), not from this
@@ -340,8 +374,16 @@ export default function App() {
     bottomRef.current?.scrollIntoView({ block: "end" });
   }, [messages]);
 
+  // The merchant/shop card needs BOTH the API URL and the admin access key set
+  // in Settings — without them the lookup can't run, so the whole block stays
+  // hidden until they're provided.
+  const merchantConfigured = apiUrl.trim() !== "" && accessKey.trim() !== "";
+  merchantConfiguredRef.current = merchantConfigured;
+
   // Fetch + render the summary for a shop domain. Empty domain → hide the card.
   const applySummary = async (domain: string) => {
+    // No config → never show the card, whatever's on the page.
+    if (!merchantConfiguredRef.current) domain = "";
     setShopDetected(!!domain);
     setSummaryState("loading");
     setSummaryErr(undefined);
@@ -368,6 +410,7 @@ export default function App() {
 
   // Manual/forced load (first open, ↻): re-detect and reload no matter what.
   const loadSummary = async () => {
+    if (!merchantConfiguredRef.current) return void applySummary("");
     await applySummary(await readShopDomain());
   };
 
@@ -376,23 +419,35 @@ export default function App() {
   // confident there's no shop on the page (ordinary tab). A newer signal
   // supersedes an in-flight poll so triggers don't stack.
   const reloadIfShopChanged = async () => {
+    // No config → the card is disabled; make sure any prior one is cleared.
+    if (!merchantConfiguredRef.current) {
+      setOnFb(false);
+      if (loadedDomainRef.current) await applySummary("");
+      return;
+    }
     const gen = ++pollGenRef.current;
-    // Off Featurebase there's never a shop — hide the card at once instead of
-    // polling readShopDomain for 3s waiting for an SPA that isn't there.
-    if (!(await isFeaturebasePage())) {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const url = tab?.url ?? "";
+    setOnFb(isFeaturebaseUrl(url));
+    // chrome://, the new-tab page, the web store, … can never carry a shop.
+    if (!/^https?:/i.test(url)) {
       if (gen === pollGenRef.current && loadedDomainRef.current) await applySummary("");
       return;
     }
-    for (let i = 0; i < 6; i++) {
+    // Featurebase is an SPA (tickets swap in place) and a storefront's
+    // window.Shopify may hydrate a beat after load — poll briefly. A storefront
+    // is usually ready at once, so it needs far fewer attempts than the inbox.
+    const tries = isFeaturebaseUrl(url) ? 6 : 2;
+    for (let i = 0; i < tries; i++) {
       if (gen !== pollGenRef.current) return; // a newer signal took over
       const domain = await readShopDomain();
       if (domain) {
         if (domain !== loadedDomainRef.current) await applySummary(domain);
         return;
       }
-      await sleep(500);
+      if (i < tries - 1) await sleep(500);
     }
-    // No shop domain after ~3s → hide the card if one was showing.
+    // Nothing found → hide the card if one was showing.
     if (gen === pollGenRef.current && loadedDomainRef.current) await applySummary("");
   };
   reloadRef.current = reloadIfShopChanged;
@@ -402,6 +457,18 @@ export default function App() {
     void loadSummary();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // React to the merchant config being added/removed in Settings: re-detect so
+  // the card appears as soon as both fields are filled and disappears when
+  // either is cleared. Skips the initial mount (loadSummary already ran).
+  const cfgMounted = useRef(false);
+  useEffect(() => {
+    if (!cfgMounted.current) {
+      cfgMounted.current = true;
+      return;
+    }
+    void reloadRef.current?.();
+  }, [merchantConfigured]);
 
   // Re-detect the merchant + follow the active tab (for capture) whenever the
   // open tab may have changed: SPA URL change / full load, tab switch, refocus.
@@ -680,6 +747,32 @@ export default function App() {
                           : 'AI attaches this when it needs console/network (Chrome shows a "being debugged" banner then).'}
                     </p>
                   )}
+                  <label className="mt-2 flex cursor-pointer items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 accent-accent"
+                      checked={mcpTeam}
+                      onChange={(e) => setMcpTeam(e.target.checked)}
+                    />
+                    <ShieldAlert className="h-4 w-4 text-muted" />
+                    Team MCP tools
+                  </label>
+                  {mcpTeam && (
+                    <div className="mt-1 flex flex-col gap-1 pl-6">
+                      <p className="text-[10px] leading-tight text-neutral-500">
+                        Exposes your own <code>claude</code> MCP servers to the panel. Tools/servers listed
+                        below auto-run; anything else asks for approval in a popup.
+                      </p>
+                      <textarea
+                        value={mcpAllowText}
+                        onChange={(e) => setMcpAllowText(e.target.value)}
+                        placeholder="mcp__postgres_readonly, mcp__clickup_local, mcp__sentry"
+                        spellCheck={false}
+                        rows={2}
+                        className="w-full rounded-lg border border-neutral-300 bg-white px-2.5 py-1.5 font-mono text-xs text-neutral-800 outline-none placeholder:text-neutral-400 focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/30"
+                      />
+                    </div>
+                  )}
                   <div className="mt-2.5 flex flex-col gap-1">
                     <span className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-neutral-500">
                       <FolderGit2 className="h-3.5 w-3.5" />
@@ -748,15 +841,27 @@ export default function App() {
         </div>
       </header>
 
-      {/* pinned merchant summary — only when a shop is detected on the page */}
-      {shopDetected && (
+      {/* pinned merchant summary — shown only when a shop is detected on the page
+          AND the merchant API URL + admin access key are set (Settings). */}
+      {merchantConfigured && shopDetected && (
         <MerchantCard
           summary={summary}
           state={summaryState}
           err={summaryErr}
           onRefresh={loadSummary}
           onDraftReply={() => submit(DRAFT_REPLY_INSTRUCTION)}
+          onFeaturebase={onFb}
           busy={running}
+        />
+      )}
+
+      {permAsk && (
+        <PermissionPrompt
+          ask={permAsk.ask}
+          onDecide={(d) => {
+            permAsk.resolve(d);
+            setPermAsk(null);
+          }}
         />
       )}
 
@@ -768,7 +873,7 @@ export default function App() {
             <p className="text-sm">Ask anything, or tell me what to do on this tab.</p>
             <p className="text-xs">
               I can read &amp; control the page, open/switch/close tabs, debug its console/network, and read your repo. On
-              a Featurebase ticket, use “Draft reply” on the merchant card.
+              a Featurebase ticket or a Shopify store, the merchant card shows account details.
             </p>
           </div>
         ) : (
@@ -877,6 +982,7 @@ function MerchantCard({
   err,
   onRefresh,
   onDraftReply,
+  onFeaturebase,
   busy,
 }: {
   summary: ShopSummary | null;
@@ -884,6 +990,7 @@ function MerchantCard({
   err?: string;
   onRefresh: () => void;
   onDraftReply: () => void;
+  onFeaturebase: boolean;
   busy: boolean;
 }) {
   const [open, setOpen] = useState(false);
@@ -913,18 +1020,20 @@ function MerchantCard({
             <ChevronDown className={cx("h-3.5 w-3.5 shrink-0 text-muted transition-transform", open && "rotate-180")} />
           )}
           <div className="ml-auto flex shrink-0 items-center gap-1">
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onDraftReply();
-              }}
-              disabled={busy}
-              title="Draft a support reply into the chat"
-              className="inline-flex items-center gap-1 rounded-lg bg-accent-soft px-2 py-1 text-xs font-medium text-accent transition-opacity hover:opacity-90 disabled:opacity-40"
-            >
-              <Headset className="h-3.5 w-3.5" />
-              Draft reply
-            </button>
+            {onFeaturebase && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDraftReply();
+                }}
+                disabled={busy}
+                title="Draft a support reply into the chat"
+                className="inline-flex items-center gap-1 rounded-lg bg-accent-soft px-2 py-1 text-xs font-medium text-accent transition-opacity hover:opacity-90 disabled:opacity-40"
+              >
+                <Headset className="h-3.5 w-3.5" />
+                Draft reply
+              </button>
+            )}
             <button
               aria-label="Refresh merchant"
               title="Refresh"
@@ -1022,6 +1131,49 @@ function MerchantCard({
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+// Team-MCP approval popup: the CLI asked to run a tool that isn't auto-allowed.
+// Allow → run with the shown input; Deny → the model is told the user declined.
+function PermissionPrompt({ ask, onDecide }: { ask: PermissionAsk; onDecide: (d: PermissionDecision) => void }) {
+  const name = ask.toolName.replace(/^mcp__/, "").replace(/__/g, " · ");
+  const pretty = (() => {
+    try {
+      const s = JSON.stringify(ask.input ?? {}, null, 2);
+      return s === "{}" ? "" : s;
+    } catch {
+      return "";
+    }
+  })();
+  return (
+    <div className="fixed inset-0 z-[60] flex items-end justify-center bg-black/30 p-3">
+      <div className="w-full max-w-sm rounded-xl border border-border bg-elevated p-3 shadow-xl">
+        <div className="flex items-center gap-2">
+          <ShieldAlert className="h-4 w-4 text-accent" />
+          <span className="text-sm font-semibold">Approve tool call?</span>
+        </div>
+        <p className="mt-1 text-xs text-muted">The assistant wants to run a tool that isn't on the auto-run list:</p>
+        <div className="mt-1.5 break-all rounded-lg bg-surface px-2 py-1 font-mono text-xs">{name}</div>
+        {pretty && (
+          <pre className="mt-1.5 max-h-40 overflow-auto rounded-lg bg-surface px-2 py-1.5 text-[11px] leading-snug">{pretty}</pre>
+        )}
+        <div className="mt-2.5 flex justify-end gap-2">
+          <button
+            onClick={() => onDecide({ behavior: "deny", message: "Denied by user" })}
+            className="rounded-lg border border-border px-3 py-1.5 text-sm hover:bg-border/40"
+          >
+            Deny
+          </button>
+          <button
+            onClick={() => onDecide({ behavior: "allow", updatedInput: ask.input ?? {} })}
+            className="rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-accent-fg hover:opacity-90"
+          >
+            Allow
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

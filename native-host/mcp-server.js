@@ -263,13 +263,39 @@ const TOOLS = [
   },
 ];
 
+// The permission-prompt tool (team-MCP mode). host.js points
+// --permission-prompt-tool at mcp__fbbridge__permission_request and sets
+// FB_PERMISSION_TOOL=1. The CLI calls it for any tool NOT in --allowedTools with
+// { tool_name, input, tool_use_id }; we forward that to the panel for an
+// allow/deny and return the CLI-expected { behavior, updatedInput|message } (the
+// generic tools/call path below already JSON-stringifies the panel's answer).
+const PERMISSION_TOOL = {
+  name: "permission_request",
+  description: "Internal permission gate — do not call this yourself; the runtime invokes it to approve tool calls.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      tool_name: { type: "string" },
+      input: { type: "object" },
+      tool_use_id: { type: "string" },
+    },
+    required: ["tool_name"],
+  },
+};
+
 // The host sets FB_TOOLS to the comma-separated names it enabled for this
-// session; advertise/allow only those. Unset (e.g. run standalone) = all tools.
+// session; advertise/allow only those. When FB_TOOLS is UNSET (run standalone)
+// we expose all tools; when it's set-but-empty (host enabled no page tools) we
+// expose none — distinct cases, so check presence, not truthiness.
 const ENABLED = (process.env.FB_TOOLS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-const ACTIVE_TOOLS = ENABLED.length ? TOOLS.filter((t) => ENABLED.includes(t.name)) : TOOLS;
+const ACTIVE_TOOLS = process.env.FB_TOOLS !== undefined ? TOOLS.filter((t) => ENABLED.includes(t.name)) : [...TOOLS];
+// In team-MCP mode, add the permission gate so it's discoverable + callable.
+if (process.env.FB_PERMISSION_TOOL === "1" && !ACTIVE_TOOLS.some((t) => t.name === PERMISSION_TOOL.name)) {
+  ACTIVE_TOOLS.push(PERMISSION_TOOL);
+}
 
 // ---- unix socket to host.js ----------------------------------------------
 
