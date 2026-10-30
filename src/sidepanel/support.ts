@@ -220,17 +220,43 @@ export function contextBlock(ctx: FbContext, now = Date.now(), lang = ""): strin
 }
 
 /**
- * Later turns: only what changed since the model last saw the conversation (new
- * messages, a state change), not the whole transcript again, which would pile
- * up in the session's context. `seen` = the message ids it already has.
+ * What the session has seen of each message (a hash of its text, when, who), to
+ * tell new, edited and deleted ones apart. Small enough to keep with the chat,
+ * so a resumed session picks up where it left off.
  */
-export function contextDelta(ctx: FbContext, seen: Set<string>, prevState: string, now = Date.now(), lang = ""): string {
+export type Seen = Map<string, { h: string; at: string; who: string }>;
+function hashText(t: string): string {
+  let h = 5381;
+  for (let i = 0; i < t.length; i++) h = ((h << 5) + h + t.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+export const seenOf = (ctx: FbContext): Seen =>
+  new Map(ctx.messages.map((m) => [m.id, { h: hashText(m.text), at: m.at, who: speaker(m) }]));
+
+/**
+ * Later turns: only what changed since the model last saw the conversation (new,
+ * edited or deleted messages, a state change), not the whole transcript again,
+ * which would pile up in the session's context.
+ */
+export function contextDelta(ctx: FbContext, seen: Seen, prevState: string, now = Date.now(), lang = ""): string {
   const fresh = ctx.messages.filter((m) => !seen.has(m.id));
-  if (!fresh.length && ctx.state === prevState) return "[The conversation hasn't changed since your last turn.]";
+  const edited = ctx.messages.filter((m) => seen.has(m.id) && seen.get(m.id)!.h !== hashText(m.text));
+  // Only the last 40 messages come in: an older one dropping off isn't a deletion.
+  const oldest = ctx.messages.length ? Date.parse(ctx.messages[0].at) : Infinity;
+  const ids = new Set(ctx.messages.map((m) => m.id));
+  const removed = [...seen.entries()].filter(([id, v]) => !ids.has(id) && Date.parse(v.at) >= oldest);
+  if (!fresh.length && !edited.length && !removed.length && ctx.state === prevState) {
+    return "[The conversation hasn't changed since your last turn.]";
+  }
   return [
     `[Featurebase conversation #${ctx.conversationId}: what changed since your last turn]`,
     ...(ctx.state !== prevState ? [`State: ${ctx.state} (was ${prevState || "unknown"}).`] : []),
-    ...(fresh.length ? ["New messages (oldest first, UTC):", ...fresh.map(line)] : ["No new messages."]),
+    ...(fresh.length ? ["New messages (oldest first, UTC):", ...fresh.map(line)] : []),
+    ...(edited.length ? ["Edited (they now read):", ...edited.map(line)] : []),
+    ...(removed.length
+      ? ["Deleted:", ...removed.map(([, v]) => `- ${isNaN(Date.parse(v.at)) ? "?" : utc(Date.parse(v.at))} ${v.who}'s message`)]
+      : []),
+    ...(!fresh.length && !edited.length && !removed.length ? ["No new messages."] : []),
     ...statusLines(ctx, now, lang),
   ].join("\n");
 }
@@ -491,32 +517,34 @@ export function wasSent(draft: string, ctx: FbContext | null): boolean {
 // closing or wrap-up message, or an "I'm on it" acknowledgement. One of our
 // templates (any language we have), or a short message that reads like one
 // (a contextual one the model wrote).
-const CHECKIN_RE = /\b(still there|still with me|checking in|check in on you)\b|còn ở đây|còn ở đó|hỗ trợ thêm gì/i;
+// Phrases only decide for short messages that are nothing but the follow-up: a
+// real answer may well end with "anything else?" or say "in summary".
+const CHECKIN_RE = /\b(still there|still with me|checking in|check in on you)\b|còn ở đây|còn ở đó/i;
 const CLOSE_RE =
-  /\b(close this (chat|conversation)|closing (this|the) (chat|conversation)|haven't heard back|to summari[sz]e|to sum up|in summary)\b|đóng cuộc trò chuyện|đóng hội thoại|tóm lại/i;
+  /\b(close this (chat|conversation)|closing (this|the) (chat|conversation)|haven't heard back)\b|đóng cuộc trò chuyện|đóng hội thoại/i;
 const ACK_RE = /\b(looking into (this|it) now|checking (this|it) now|let me (check|look into) (this|that))\b|đang kiểm tra và sẽ/i;
 export type FollowUpKind = "checkin" | "close" | "ack";
 // Drafts the panel's own buttons produced (a check-in, a wrap-up, an
 // acknowledgement), in whatever language: once sent they're recognised as such.
 export interface KnownFollowUp {
   text: string;
-  kind: FollowUpKind;
+  kind: FollowUpKind | "answer"; // "answer": a real reply drafted here, never a follow-up
 }
 export function followUpKind(text: string, customerName: string, known: KnownFollowUp[] = []): FollowUpKind | null {
   const like = (t: string) => overlap(t, text) >= enough(t);
   const mine = known.find((k) => k.text && like(k.text));
-  if (mine) return mine.kind;
+  if (mine) return mine.kind === "answer" ? null : mine.kind;
   const tpl = (...kinds: ("checkin" | "checkin2" | "close")[]) =>
     kinds.some((kind) => (["en", "vi"] as const).some((l) => like(followUp(kind, customerName, l).text)));
   if (tpl("close")) return "close";
   if (tpl("checkin", "checkin2")) return "checkin";
   const { first } = greeting(customerName);
   if (Object.values(ACK).some((a) => like(a(first)))) return "ack";
-  // A wrap-up sums things up, so it may run longer than a check-in.
-  if (text.length <= 700 && CLOSE_RE.test(text)) return "close";
-  if (text.length > 320) return null; // a real answer that happens to end with "anything else?"
-  if (CHECKIN_RE.test(text)) return "checkin";
-  if (ACK_RE.test(text)) return "ack";
+  if (text.length <= 300 && CLOSE_RE.test(text)) return "close";
+  if (text.length > 150) return null;
+  const asks = text.includes("?");
+  if (asks && CHECKIN_RE.test(text)) return "checkin"; // "are you still there?"
+  if (!asks && ACK_RE.test(text)) return "ack"; // "I'm on it", asking nothing of them
   return null;
 }
 
@@ -576,4 +604,17 @@ export function parseReply(text: string): ParsedReply | null {
     else out.analysis += (out.analysis ? "\n\n" : "") + `**${title}**\n\n${body}`;
   });
   return out;
+}
+
+// Every streamed frame re-renders the chat; parsing each reply once per text
+// (not once per frame) keeps that cheap.
+const parsed = new Map<string, ParsedReply | null>();
+export function parseReplyCached(text: string): ParsedReply | null {
+  let r = parsed.get(text);
+  if (r === undefined) {
+    r = parseReply(text);
+    parsed.set(text, r);
+    if (parsed.size > 300) parsed.delete(parsed.keys().next().value!);
+  }
+  return r;
 }

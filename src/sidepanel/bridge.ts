@@ -60,6 +60,8 @@ export interface SessionCfg {
   shell: boolean; // Bash allowed, every command approved through the popup
   systemPrompt?: string; // appended to the CLI's system prompt (support role in the Featurebase tab)
   lean?: boolean; // narrow tool set + only the support skill's plugin (Featurebase tab)
+  skill?: string; // "<plugin>:<skill>" the host puts into the system prompt (cached across sessions)
+  resume?: string; // a CLI session id to continue instead of starting fresh
 }
 
 // A tool call the CLI wants approved (team-MCP mode: anything not auto-allowed).
@@ -80,7 +82,11 @@ export type HostEvent =
   | { type: "stderr"; id: number; data: string }
   | { type: "error"; id?: number; error: string }
   | { type: "done"; id: number; code: number }
-  | { type: "disconnected"; error?: string };
+  | { type: "disconnected"; error?: string }
+  // The CLI session id of the conversation that just started (for --resume).
+  | { type: "cli_session"; sessionId: string; id?: undefined }
+  // Answer to a reset that asked to resume: ok = its transcript is still on disk.
+  | { type: "resume"; sessionId: string; ok: boolean; id?: undefined };
 
 // Merchant summary the host fetches from the pod-shopify-backend admin GraphQL.
 export interface ShopSummary {
