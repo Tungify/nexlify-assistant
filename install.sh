@@ -33,7 +33,13 @@ cat > "$HOST_SH" <<EOF
 export PATH="$EXTRA_PATH:/opt/homebrew/bin:/usr/local/bin:\$HOME/.local/bin:\$PATH"
 export CLAUDE_BIN="$CLAUDE_BIN"
 export CODEX_BIN="$CODEX_BIN"
-exec "$NODE_BIN" "$HOST_JS" "\$@"
+# The node baked in at install time disappears when nvm upgrades it (Chrome then
+# only says "Native host has exited"). Fall back to any node on PATH, then the
+# newest nvm-installed one.
+NODE="$NODE_BIN"
+[ -x "\$NODE" ] || NODE="\$(command -v node || true)"
+[ -n "\$NODE" ] && [ -x "\$NODE" ] || NODE="\$(ls -1d "\$HOME"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V | tail -1)"
+exec "\$NODE" "$HOST_JS" "\$@"
 EOF
 chmod +x "$HOST_SH"
 

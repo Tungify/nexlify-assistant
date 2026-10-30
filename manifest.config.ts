@@ -22,10 +22,16 @@ export default defineManifest({
   // (and reconnects it) so the browser tools work with the side panel closed.
   // "contextMenus" adds the right-click "Download video" entry on social posts;
   // "notifications" reports download progress/result without needing the panel.
+  // "userScripts" is how run_js executes arbitrary JS in the page's OWN world
+  // without eval, so a strict page CSP can't block it. It needs a one-time opt-in
+  // per extension ("Allow user scripts" on the chrome://extensions details page);
+  // until then run_js falls back to chrome.scripting + new Function. Harmless
+  // when off — the API namespace simply isn't there.
   permissions: [
     "sidePanel",
     "nativeMessaging",
     "scripting",
+    "userScripts",
     "tabs",
     "debugger",
     "storage",
@@ -50,6 +56,20 @@ export default defineManifest({
       js: ["src/content/videoPick.ts"],
       run_at: "document_start",
       all_frames: true,
+    },
+    // A "Claude" tab beside Copilot in the Featurebase inbox sidebar that embeds
+    // the assistant. Inert on pages without that sidebar. See featurebaseTab.ts.
+    {
+      matches: ["https://*.featurebase.app/*"],
+      js: ["src/content/featurebaseTab.ts"],
+      run_at: "document_idle",
+    },
+  ],
+  // Lets that tab load the assistant page in an iframe — Featurebase only.
+  web_accessible_resources: [
+    {
+      resources: ["src/sidepanel/index.html"],
+      matches: ["https://*.featurebase.app/*"],
     },
   ],
   // Page-proof trigger: works even when a site overlays the video or hijacks the
