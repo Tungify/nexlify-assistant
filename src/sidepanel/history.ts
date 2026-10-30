@@ -13,6 +13,9 @@ export interface Conversation {
   title: string;
   updatedAt: number; // ms epoch
   messages: StoredMsg[];
+  // Featurebase tab: the support conversation this chat belongs to. `ended` is
+  // set when the agent closed the chat session after the conversation closed.
+  ticket?: { id: string; name: string; ended?: boolean };
 }
 
 const KEY = "conversations";

@@ -1,9 +1,12 @@
 "use strict";
 
 // Minimal MCP stdio server (JSON-RPC 2.0, newline-delimited), zero deps.
-// Claude Code spawns this and discovers two tools. When a tool is called, we
-// forward it over a unix socket to host.js, which relays it to the browser
+// Claude Code spawns this and discovers the browser tools. When a tool is called,
+// we forward it over a unix socket to host.js, which relays it to the browser
 // extension to run against the live DOM, and returns the result.
+//
+// The extension runs every tool in its background service worker, so the side
+// panel doesn't have to be open — only Chrome does.
 
 const net = require("net");
 
@@ -118,6 +121,51 @@ const TOOLS = [
         timeoutMs: { type: "number", description: "Max wait in ms (default 5000, capped 30000)." },
       },
       required: ["selector"],
+    },
+  },
+  // ---- escape hatch: arbitrary JavaScript in the page --------------------
+  {
+    name: "run_js",
+    description:
+      "Run JavaScript in the tab the user is looking at — the equivalent of typing into the DevTools console. Reach " +
+      "for it when the fixed tools aren't enough: extract structured data in ONE call (map over DOM nodes instead of " +
+      "many query_dom calls), read the site's own globals (window.__NEXT_DATA__, window.Shopify, a Redux store), " +
+      "read/write localStorage & sessionStorage, fetch() a same-origin API with the user's cookies, compute layout/" +
+      "styles, or drive widgets a plain click can't.\n" +
+      "The code runs as a function body: `return` the value you want (a bare one-line expression is returned for " +
+      "you), and `await` is allowed at top level. console.log/warn/error output during the run comes back in `logs`, " +
+      "and a thrown error comes back as { ok: false, error, stack } — so this is also a fast way to test a snippet.\n" +
+      "Results are serialized for you: DOM elements become { el, id, class, text, href }, Errors/Map/Set/Date get " +
+      "readable stand-ins, and depth/size caps apply — so prefer returning plain objects/arrays of exactly the " +
+      "fields you need over whole DOM nodes. Reply fields: { ok, type, result, logs?, engine, world, tookMs, note? } " +
+      "— read `note` when present, it explains a degraded run.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        code: {
+          type: "string",
+          description:
+            'JavaScript to run in the page. Use `return` for the value, e.g. `return [...document.querySelectorAll("tr")].map(r => r.innerText)`. Top-level await is allowed.',
+        },
+        world: {
+          type: "string",
+          enum: ["main", "isolated"],
+          description:
+            'Which JS world to run in. "main" (default) is the page\'s own context — the site\'s window globals and libraries are visible. "isolated" runs in the extension\'s world: the DOM, cookies, storage and fetch are still the page\'s, but the site\'s window globals are not — use it only if you want to be sure you touch nothing the page can see.',
+        },
+        timeoutMs: {
+          type: "number",
+          description: "Max time to wait for async code to settle (default 8000, capped 25000).",
+        },
+        maxChars: { type: "number", description: "Cap for each individual string in the result (default 4000)." },
+        maxItems: { type: "number", description: "Cap for array/collection entries and object keys (default 100)." },
+        maxDepth: { type: "number", description: "How deep to serialize nested objects (default 4)." },
+        maxTotalChars: {
+          type: "number",
+          description: "Cap for the whole serialized result (default 30000); beyond it the result is truncated.",
+        },
+      },
+      required: ["code"],
     },
   },
   // ---- debug (console + network capture; the CDP debugger attaches the first
@@ -348,15 +396,27 @@ function callTool(tool, args) {
     try {
       s = await ensureSock();
     } catch (e) {
+      // The extension's background worker owns this socket, so the side panel
+      // does NOT need to be open — but Chrome does need to be running with the
+      // extension loaded (and install.sh registered for it).
       return reject(
-        new Error("browser bridge not connected (open the Nexlify Assistant side panel in Chrome): " + e.message),
+        new Error("browser bridge not connected — is Chrome running with the Nexlify Assistant extension loaded? " + e.message),
       );
     }
     const callId = `${prefix}-${++counter}`;
+    // An approval waits on a human reading the command, so give it far longer
+    // than a browser action.
+    const isApproval = tool === PERMISSION_TOOL.name;
     const timer = setTimeout(() => {
       pending.delete(callId);
-      reject(new Error("timed out waiting for the browser (is the side panel open?)"));
-    }, 30000);
+      reject(
+        new Error(
+          isApproval
+            ? "no answer to the approval popup within 10 minutes — treated as denied"
+            : "timed out after 30s waiting for the browser (the tab may be stuck loading, or on a page the extension can't touch such as chrome:// or the Web Store)",
+        ),
+      );
+    }, isApproval ? 10 * 60 * 1000 : 30000);
     pending.set(callId, { resolve, reject, timer });
     s.write(JSON.stringify({ type: "call", callId, tool, args }) + "\n");
   });

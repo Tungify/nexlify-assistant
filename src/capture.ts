@@ -1,16 +1,21 @@
 // Console + network capture via the Chrome DevTools Protocol (chrome.debugger).
 //
-// When the "Capture console & network" setting is on, the panel attaches the
-// debugger to whatever tab is active and buffers what it sees — console output,
-// uncaught errors, browser log entries (CORS/CSP/mixed-content…), and every
-// network request. The CLI reads that buffer through the get_console_logs /
-// get_network_requests / get_network_request tools to answer "why didn't this
-// event fire / this request go out".
+// This lives in the BACKGROUND SERVICE WORKER — one owner for the whole
+// extension — so the buffer keeps filling with the side panel closed and an
+// external CLI can read it. (A tab allows only one debugger client, so a second
+// Capture in the panel would fight this one for the attachment.) The panel talks
+// to it over chrome.runtime messaging; see background.ts.
+//
+// It attaches the debugger to whatever tab is active and buffers what it sees —
+// console output, uncaught errors, browser log entries (CORS/CSP/mixed-content…),
+// and every network request. The CLI reads that buffer through the
+// get_console_logs / get_network_requests / get_network_request tools to answer
+// "why didn't this event fire / this request go out".
 //
 // Only ONE debugger client can own a tab, so if DevTools is open on the tab the
 // attach fails — that's surfaced through onStatus. Attaching also shows Chrome's
 // yellow "… is debugging this browser" banner; that's expected while capture is
-// on.
+// on — dismissing it is the user's one-click way to stop capturing.
 
 const PROTOCOL = "1.3";
 const CONSOLE_CAP = 600; // ring-buffer sizes — keep memory bounded on chatty pages
@@ -155,7 +160,7 @@ export class Capture {
     if (this.attached && this.tabId === id) return; // already on this tab
     if (this.attached) await this.detach();
     try {
-      await chrome.debugger.attach({ tabId: id }, PROTOCOL);
+      await this.attachTo(id);
       this.tabId = id;
       this.attached = true;
       const t: Debuggee = { tabId: id };
@@ -169,6 +174,26 @@ export class Capture {
       const msg = e instanceof Error ? e.message : String(e);
       // The usual cause is DevTools already owning the tab.
       this.emit(/devtools|already attached|another/i.test(msg) ? "close DevTools on this tab to capture" : msg);
+    }
+  }
+
+  // Attach to one tab, recovering from OUR OWN stale attachment: MV3 can recycle
+  // the service worker, which wipes this object's in-memory state while Chrome
+  // keeps the debugger session open — the next attach then fails with "already
+  // attached". Detach that orphan and retry once. When the owner is DevTools (or
+  // another extension) the detach fails too and the original error stands.
+  private async attachTo(id: number) {
+    try {
+      await chrome.debugger.attach({ tabId: id }, PROTOCOL);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!/already attached/i.test(msg)) throw e;
+      try {
+        await chrome.debugger.detach({ tabId: id });
+      } catch {
+        throw e; // not our session — keep the original "already attached" error
+      }
+      await chrome.debugger.attach({ tabId: id }, PROTOCOL);
     }
   }
 

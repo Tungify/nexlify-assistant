@@ -1,15 +1,21 @@
 // Background service worker.
 //
 // 1. Opens the side panel on toolbar click.
-// 2. Holds a persistent native-host connection so the browser tools keep working
-//    when the side panel is CLOSED. For now the worker runs the tab/navigation
-//    tools (chrome.tabs.*); page + debug tools still need the panel open. host.js
-//    pings us every ~20s so MV3 doesn't idle-suspend the worker, and an alarm
-//    reconnects it if Chrome recycles it anyway.
+// 2. Runs EVERY browser tool, so an external CLI works with the side panel
+//    CLOSED — the panel is UI, not a dependency. We hold a persistent
+//    native-host connection (host.js owns the public bridge socket outside CLIs
+//    connect to) and execute tab tools (chrome.tabs.*), page tools
+//    (chrome.scripting), screenshots (captureVisibleTab) and the console/network
+//    debug tools (chrome.debugger, buffered here — see capture.ts) ourselves.
+//    host.js pings us every ~20s so MV3 doesn't idle-suspend the worker (which
+//    would also drop the capture buffer), and an alarm reconnects it if Chrome
+//    recycles it anyway.
 // 3. Right-click "Download video" on X / Instagram / Facebook posts: extracts the
 //    post's media in-page and hands it to the host, which saves it (via yt-dlp if
 //    installed, else a direct fetch of the best MP4 URL we found).
 
+import { Capture, type CaptureStatus } from "./capture";
+import { PAGE_TOOLS, runPageTool } from "./pageTools";
 import { TAB_TOOLS, runTabTool } from "./tabTools";
 import { extractVideoInPage, type ExtractResult } from "./videoExtract";
 
@@ -58,17 +64,93 @@ function onHostMessage(m: unknown) {
 async function handleToolRequest(req: { callId: string; tool: string; args?: Record<string, unknown> }) {
   let result: Record<string, unknown>;
   try {
-    if (!TAB_TOOLS.has(req.tool)) {
-      // Page/debug tools live in the panel for now — say so instead of hanging.
-      throw new Error(`"${req.tool}" needs the side panel open (only tab tools run in the background so far)`);
-    }
-    const data = await runTabTool(req.tool, req.args ?? {});
+    const data = await runBrowserTool(req.tool, req.args ?? {});
     result = { type: "tool_result", callId: req.callId, ok: true, data };
   } catch (e) {
     result = { type: "tool_result", callId: req.callId, ok: false, error: e instanceof Error ? e.message : String(e) };
   }
   port?.postMessage(result);
 }
+
+// ==== Browser tools ========================================================
+//
+// Every tool the bridge exposes runs right here in the worker, so the side panel
+// never has to be open. The panel runs the page/tab tools itself too (same
+// modules) but delegates the debug tools to us, since a tab allows only one
+// debugger client and this worker is the single owner.
+
+// Console/network buffer (CDP). Attaches lazily on the first debug-tool call and
+// follows the active tab from then on.
+const capture = new Capture(broadcastCaptureStatus);
+const DEBUG_TOOLS = new Set(["get_console_logs", "get_network_requests", "get_network_request"]);
+
+async function runBrowserTool(tool: string, args: Record<string, unknown>): Promise<unknown> {
+  if (TAB_TOOLS.has(tool)) return await runTabTool(tool, args);
+  if (PAGE_TOOLS.has(tool)) return await runPageTool(tool, args);
+  if (DEBUG_TOOLS.has(tool)) return await runDebugTool(tool, args);
+  // permission_request lands here if an external CLI is pointed at it: that gate
+  // needs the panel's allow/deny popup, so there's nothing honest to answer with.
+  if (tool === "permission_request") {
+    throw new Error("permission_request is only available to the in-panel chat session");
+  }
+  throw new Error("unknown tool: " + tool);
+}
+
+// Capture is "AI decides": the CDP debugger attaches the first time the assistant
+// reads the buffer (that's when Chrome's "being debugged" banner appears), not
+// from a settings toggle.
+async function runDebugTool(tool: string, args: Record<string, unknown>): Promise<unknown> {
+  if (!capture.enabled) await capture.enable();
+  if (tool === "get_console_logs") return capture.getConsoleLogs(args);
+  if (tool === "get_network_requests") return capture.getNetworkRequests(args);
+  return await capture.getNetworkRequest(String(args.id ?? ""));
+}
+
+// Move the capture with the user: the debug tools always read the ACTIVE tab, and
+// the panel isn't around to drive this when it's closed. Both are no-ops while
+// capture is off.
+chrome.tabs.onActivated.addListener(() => void capture.attachToActive());
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+  if (tab.active && (changeInfo.url || changeInfo.status === "complete")) void capture.attachToActive();
+});
+
+// ---- panel ↔ worker messaging --------------------------------------------
+
+let captureStatus: CaptureStatus = { enabled: false, attached: false, tabId: null };
+
+// Push status to any open panel so its capture line stays honest. No listener
+// (panel closed) is the normal case — swallow the resulting lastError.
+function broadcastCaptureStatus(s: CaptureStatus) {
+  captureStatus = s;
+  try {
+    chrome.runtime.sendMessage({ type: "nx_capture_status", status: s }, () => void chrome.runtime.lastError);
+  } catch {
+    /* no receiver */
+  }
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  const m = msg as { type?: string; tool?: string; args?: Record<string, unknown>; enabled?: boolean } | null;
+  if (!m) return;
+  // The panel's CLI called a debug tool — we own the debugger, so we answer.
+  if (m.type === "nx_capture_read" && typeof m.tool === "string") {
+    runDebugTool(m.tool, m.args ?? {})
+      .then((data) => sendResponse({ ok: true, data }))
+      .catch((e) => sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }));
+    return true; // keep the channel open for the async reply
+  }
+  // The panel's "Allow console & network capture" toggle went off → detach now
+  // (that's what removes Chrome's banner).
+  if (m.type === "nx_capture_enabled") {
+    if (m.enabled === false) void capture.disable();
+    return;
+  }
+  // A freshly opened panel asks for the current state.
+  if (m.type === "nx_capture_status") {
+    sendResponse({ status: captureStatus });
+    return;
+  }
+});
 
 // ==== Right-click "Download video" ========================================
 

@@ -136,10 +136,11 @@ ensurePublicBridge();
 const publicReassert = setInterval(ensurePublicBridge, 10000);
 if (publicReassert.unref) publicReassert.unref();
 
-// Heartbeat: when our peer is the background service worker (which runs tools
-// with the panel closed), MV3 idle-suspends it after ~30s. Any inbound message
-// resets that timer, so ping every 20s to keep it — and thus this host and the
-// public socket — alive. The side-panel peer ignores unknown message types.
+// Heartbeat: when our peer is the background service worker (which runs ALL the
+// browser tools, so they work with the panel closed), MV3 idle-suspends it after
+// ~30s. Any inbound message resets that timer, so ping every 20s to keep it —
+// and thus this host, the public socket, and the worker's CDP capture buffer —
+// alive. The side-panel peer ignores unknown message types.
 const heartbeat = setInterval(() => {
   try {
     send({ type: "__ping" });
@@ -162,13 +163,95 @@ if (heartbeat.unref) heartbeat.unref();
 // tab; TAB = open/close/switch/navigate tabs for the whole window; DEBUG = read
 // the console/network capture buffer. The panel gates each group with a setting;
 // we advertise only the enabled ones (FB_TOOLS).
-const PAGE_TOOLS = ["get_page", "query_dom", "screenshot", "click", "type_text", "press_key", "scroll_to", "wait_for"];
+const PAGE_TOOLS = ["get_page", "query_dom", "screenshot", "click", "type_text", "press_key", "scroll_to", "wait_for", "run_js"];
 const TAB_TOOLS = ["list_tabs", "open_tab", "close_tab", "switch_tab", "navigate", "reload_tab", "go_back", "go_forward"];
 const DEBUG_TOOLS = ["get_console_logs", "get_network_requests", "get_network_request"];
 // Built-in Claude tools allowed only when a local repo path is set (read-only).
 const REPO_TOOLS = ["Read", "Grep", "Glob"];
-// Never let Claude mutate the machine: no shell, no file writes.
-const NO_BUILTIN_TOOLS = "Bash,Edit,Write,MultiEdit,NotebookEdit";
+// Never let Claude edit files directly. The shell is off too, unless the user
+// turns on "Run shell commands" — then Bash is allowed but EVERY command goes
+// through the in-panel approval popup (see buildArgs).
+const NO_WRITE_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+// The user's own claude config may register this very mcp-server.js (e.g. as
+// "nexlify-browser", so Claude Code sessions can drive the browser through the
+// public socket). Team-MCP mode loads that config, and the panel then sees a
+// second copy of its browser tools: not on the auto-run list (an approval popup
+// for a page read) and bound to whichever Chrome owns the public socket (it
+// listed another profile's tabs). Hide it; the panel has fbbridge.
+function ownBrowserServers() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".claude.json"), "utf8"));
+    const servers = { ...(cfg.mcpServers || {}) };
+    for (const p of Object.values(cfg.projects || {})) Object.assign(servers, (p && p.mcpServers) || {});
+    return Object.entries(servers)
+      .filter(([, s]) => s && [s.command, ...(s.args || [])].some((a) => typeof a === "string" && path.resolve(a) === MCP_SERVER))
+      .map(([name]) => "mcp__" + name);
+  } catch {
+    return ["mcp__nexlify-browser"];
+  }
+}
+
+// Lean sessions (the Featurebase support tab): only the plugin the support
+// skill lives in. Every other enabled plugin (and skills-dir plugin) is switched
+// off for this session only; with the narrow --tools list this took the context
+// a session starts with from ~39k to ~11k tokens and cut ~1 s off start-up.
+const LEAN_KEEP_PLUGINS = ["customei@skills-dir"];
+function leanPluginSettings() {
+  const off = {};
+  const home = os.homedir();
+  for (const f of ["settings.json", "settings.local.json"]) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(path.join(home, ".claude", f), "utf8"));
+      for (const [id, on] of Object.entries(cfg.enabledPlugins || {})) if (on) off[id] = false;
+    } catch {
+      /* missing or unreadable: nothing to switch off */
+    }
+  }
+  try {
+    for (const name of fs.readdirSync(path.join(home, ".claude", "skills"))) {
+      if (fs.existsSync(path.join(home, ".claude", "skills", name, ".claude-plugin", "plugin.json"))) off[`${name}@skills-dir`] = false;
+    }
+  } catch {
+    /* no skills dir */
+  }
+  for (const id of LEAN_KEEP_PLUGINS) delete off[id];
+  return { enabledPlugins: off };
+}
+// Built-in tools a support session needs: Read (the skill's references),
+// Skill, ToolSearch (deferred MCP tools); Bash only with shell on, Grep/Glob
+// only with a repo. The rest (subagents, workflows, artifacts, web, cron …)
+// carry long descriptions the support tab never uses.
+const leanTools = ({ shell, repoPath }) =>
+  ["Read", "Skill", "ToolSearch", ...(shell ? ["Bash"] : []), ...(repoPath ? ["Grep", "Glob"] : [])].join(",");
+
+// Forces an approval for every Bash command. Without it Claude Code auto-runs
+// commands it deems read-only (echo, ls, cat …) even in default permission mode;
+// with "ask" they all reach --permission-prompt-tool. Verified on claude 2.1.314.
+const ASK_EVERY_BASH = {
+  hooks: {
+    PreToolUse: [
+      {
+        matcher: "Bash",
+        hooks: [
+          {
+            type: "command",
+            command:
+              "echo '" +
+              JSON.stringify({
+                hookSpecificOutput: {
+                  hookEventName: "PreToolUse",
+                  permissionDecision: "ask",
+                  permissionDecisionReason: "Nexlify: every shell command needs approval",
+                },
+              }) +
+              "'",
+          },
+        ],
+      },
+    ],
+  },
+};
 
 function bridgeConfig(toolNames, permission) {
   const env = { FB_BRIDGE_SOCK: SOCK, FB_TOOLS: toolNames.join(",") };
@@ -213,6 +296,14 @@ function sessionCfg(msg) {
     // read tools/servers they listed, everything else goes through the popup.
     mcpTeam,
     mcpAllow: mcpTeam && Array.isArray(msg.mcpAllow) ? msg.mcpAllow.map((s) => String(s).trim()).filter(Boolean) : [],
+    // Shell: Bash allowed, each command approved in the panel popup. Lets skills
+    // that run scripts (customei-admin, gemcommerce-admin, …) actually work.
+    shell: canTools && !!msg.shell,
+    // Standing instructions for the session (the Featurebase tab sends the
+    // support role), appended to Claude Code's own system prompt.
+    systemPrompt: typeof msg.systemPrompt === "string" ? msg.systemPrompt.trim().slice(0, 12000) : "",
+    // Lean: a narrow tool set and only the support skill's plugin (the Featurebase tab).
+    lean: canTools && !!msg.lean,
   };
 }
 
@@ -221,7 +312,7 @@ const PROVIDERS = {
     cmd: process.env.CLAUDE_BIN || "claude",
     format: "claude-stream-json",
     supportsTools: true,
-    buildArgs({ page, tabs, capture, repoPath, model, effort, mcpTeam, mcpAllow }) {
+    buildArgs({ page, tabs, capture, repoPath, model, effort, mcpTeam, mcpAllow, shell, systemPrompt, lean }) {
       const a = [
         "-p",
         "--input-format",
@@ -231,8 +322,11 @@ const PROVIDERS = {
         "--include-partial-messages",
         "--verbose",
         "--disallowedTools",
-        NO_BUILTIN_TOOLS,
+        [...(shell ? NO_WRITE_TOOLS : ["Bash", ...NO_WRITE_TOOLS]), ...(mcpTeam ? ownBrowserServers() : [])].join(","),
       ];
+      // The approval popup (permission_request) is needed for team-MCP writes and
+      // for shell commands.
+      const gate = mcpTeam || shell;
       // Off (default): keep the browser bridge isolated — only our fbbridge tools
       // exist. Team-MCP mode: drop strict so the CLI ALSO loads the user's own
       // configured MCP servers (Sentry/ClickUp/Postgres/…), and gate any tool not
@@ -240,19 +334,29 @@ const PROVIDERS = {
       if (!mcpTeam) a.push("--strict-mcp-config");
       if (model) a.push("--model", model);
       if (effort) a.push("--effort", effort);
+      if (systemPrompt) a.push("--append-system-prompt", systemPrompt);
       const bridgeTools = [];
       if (page) bridgeTools.push(...PAGE_TOOLS);
       if (tabs) bridgeTools.push(...TAB_TOOLS);
       if (capture) bridgeTools.push(...DEBUG_TOOLS);
       const allowed = bridgeTools.map((n) => "mcp__fbbridge__" + n);
       if (repoPath) allowed.push(...REPO_TOOLS); // cwd is set to the repo in spawnSession
-      if (mcpTeam) {
+      if (gate) {
         // The gate itself must auto-run (else it'd recurse), plus the read-only
         // tools/servers the user marked auto-run; everything else hits the popup.
-        allowed.push("mcp__fbbridge__permission_request", ...(mcpAllow || []));
+        allowed.push("mcp__fbbridge__permission_request");
+        if (mcpTeam) allowed.push(...(mcpAllow || []));
         a.push("--permission-prompt-tool", "mcp__fbbridge__permission_request");
+        // The user's own default mode may be "auto", where Claude Code approves
+        // tools itself and never calls the gate (verified: Bash `touch` ran
+        // unasked). Default mode sends anything not allowed to the popup.
+        a.push("--permission-mode", "default");
       }
-      if (bridgeTools.length || mcpTeam) a.push("--mcp-config", bridgeConfig(bridgeTools, mcpTeam));
+      if (lean) a.push("--tools", leanTools({ shell, repoPath }));
+      // One --settings: the Bash approval hook and/or the lean plugin set.
+      const settings = { ...(shell ? ASK_EVERY_BASH : {}), ...(lean ? leanPluginSettings() : {}) };
+      if (Object.keys(settings).length) a.push("--settings", JSON.stringify(settings));
+      if (bridgeTools.length || gate) a.push("--mcp-config", bridgeConfig(bridgeTools, gate));
       else a.push("--mcp-config", '{"mcpServers":{}}');
       if (allowed.length) a.push("--allowedTools", allowed.join(","));
       return a;
@@ -307,7 +411,7 @@ function emitStreamLine(id, line) {
 // effort, and whether the DOM tools (and thus MCP) are wired in.
 function cfgKey(msg) {
   const c = sessionCfg(msg);
-  return JSON.stringify({ cli: msg.cli, page: c.page, tabs: c.tabs, capture: c.capture, repoPath: c.repoPath, model: c.model, effort: c.effort, mcpTeam: c.mcpTeam, mcpAllow: c.mcpAllow });
+  return JSON.stringify({ cli: msg.cli, page: c.page, tabs: c.tabs, capture: c.capture, repoPath: c.repoPath, model: c.model, effort: c.effort, mcpTeam: c.mcpTeam, mcpAllow: c.mcpAllow, shell: c.shell, systemPrompt: c.systemPrompt, lean: c.lean });
 }
 
 // Spawn an idle stream-json session for this config. The user turn arrives

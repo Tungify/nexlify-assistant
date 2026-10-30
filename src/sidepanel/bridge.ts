@@ -4,20 +4,17 @@
 // Inbound:  streamed events (chunk / tool_use / stderr / error / done) AND
 //           tool_request messages — when the CLI calls a browser tool, the host
 //           asks us to run it and we post the result back. Read/control tools
-//           run in the active tab via chrome.scripting; the debug tools read the
-//           CDP capture buffer (see capture.ts).
+//           run in the active tab via chrome.scripting (../pageTools, shared with
+//           the background worker); the debug tools read the CDP capture buffer,
+//           which the background worker owns (../capture) so it survives the
+//           panel being closed.
 
-import { Capture, type CaptureStatus } from "./capture";
-import { drive } from "./drive";
+import { type CaptureStatus } from "../capture";
+import { PAGE_TOOLS, runPageToolOn, screenshotTab } from "../pageTools";
 import { TAB_TOOLS, runTabTool, activeTab } from "../tabTools";
+import { drive } from "./drive";
 
 const HOST_NAME = "com.nexlify.assistant";
-
-// CSS selector for Featurebase's open-conversation panel. Point this at the real
-// thread container (right-click the conversation → Inspect → copy selector) so
-// get_page reads ONLY the conversation, not the ticket-list sidebar or nav.
-// Empty string = fall back to <main> / [role=main] / <article>.
-const FB_CONVO_SELECTOR = "";
 
 // Host of the Featurebase inbox/admin app. The merchant summary card is only
 // shown while the active tab is on this host (or a subdomain of it) — on any
@@ -39,8 +36,11 @@ export function isFeaturebaseUrl(url: string | undefined): boolean {
 }
 
 // Tools answered from the CDP capture buffer rather than by running in the page.
+// The buffer lives in the background worker (single debugger owner), so these are
+// the one group we delegate instead of running here.
 const DEBUG_TOOLS = new Set(["get_console_logs", "get_network_requests", "get_network_request"]);
-// TAB_TOOLS (chrome.tabs.*) are shared with the background worker — see ../tabTools.
+// PAGE_TOOLS (chrome.scripting) and TAB_TOOLS (chrome.tabs.*) are shared with the
+// background worker — see ../pageTools and ../tabTools.
 
 export type Cli = "claude" | "chatgpt";
 
@@ -57,6 +57,9 @@ export interface SessionCfg {
   effort: string;
   mcpTeam: boolean; // inherit the user's own claude MCP servers into the panel
   mcpAllow: string[]; // read tools/servers to auto-run; others go through the popup
+  shell: boolean; // Bash allowed, every command approved through the popup
+  systemPrompt?: string; // appended to the CLI's system prompt (support role in the Featurebase tab)
+  lean?: boolean; // narrow tool set + only the support skill's plugin (Featurebase tab)
 }
 
 // A tool call the CLI wants approved (team-MCP mode: anything not auto-allowed).
@@ -131,247 +134,6 @@ interface FolderPickedMsg {
 export interface FolderPickResult {
   path: string;
   error?: string;
-}
-
-// Runs INSIDE the inspected page (serialized by chrome.scripting). Must be
-// fully self-contained — no references to anything outside this function, so
-// the Featurebase selector is threaded in as an argument. Async so wait_for can
-// poll; chrome.scripting resolves the returned promise.
-async function domTool(tool: string, args: Record<string, unknown>, fbSelector: string): Promise<unknown> {
-  const cap = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "\n…[truncated]" : s);
-  // Collapse the whitespace noise you get from innerText dumps.
-  const clean = (s: string) =>
-    s
-      .replace(/[ \t]+\n/g, "\n")
-      .replace(/\n[ \t]+/g, "\n")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-  // Prefer the Featurebase conversation panel, then the main content region.
-  const convoEl = () => {
-    for (const sel of [fbSelector, "main", "[role='main']", "article"]) {
-      if (!sel) continue;
-      try {
-        const el = document.querySelector(sel) as HTMLElement | null;
-        if (el && (el.innerText ?? "").trim().length > 40) return el;
-      } catch {
-        /* invalid selector — skip */
-      }
-    }
-    return document.body;
-  };
-  const one = (sel: string) => {
-    try {
-      return document.querySelector(sel) as HTMLElement | null;
-    } catch {
-      return null;
-    }
-  };
-
-  // ---- reads --------------------------------------------------------------
-
-  if (tool === "get_page") {
-    const max = typeof args.maxChars === "number" ? (args.maxChars as number) : 6000;
-    return { url: location.href, title: document.title, text: cap(clean(convoEl()?.innerText ?? ""), max) };
-  }
-
-  if (tool === "query_dom") {
-    const selector = String(args.selector ?? "");
-    const limit = typeof args.limit === "number" ? (args.limit as number) : 20;
-    const wantHtml = args.html === true;
-    let nodes: Element[] = [];
-    try {
-      nodes = Array.from(document.querySelectorAll(selector)).slice(0, limit);
-    } catch {
-      return { error: "invalid selector: " + selector };
-    }
-    return {
-      count: nodes.length,
-      matches: nodes.map((el) =>
-        wantHtml ? cap((el as HTMLElement).outerHTML, 4000) : cap((el as HTMLElement).innerText ?? "", 2000),
-      ),
-    };
-  }
-
-  // ---- writes / control ---------------------------------------------------
-
-  if (tool === "click") {
-    const selector = String(args.selector ?? "");
-    const nth = typeof args.nth === "number" ? (args.nth as number) : 0;
-    let els: Element[] = [];
-    try {
-      els = selector ? Array.from(document.querySelectorAll(selector)) : [];
-    } catch {
-      return { ok: false, error: "invalid selector: " + selector };
-    }
-    const el = els[nth] as HTMLElement | undefined;
-    if (!el) return { ok: false, error: `no element to click (${els.length} matched)`, selector };
-    el.scrollIntoView({ block: "center", inline: "center" });
-    try {
-      el.focus({ preventScroll: true });
-    } catch {
-      /* not focusable */
-    }
-    const mo = { bubbles: true, cancelable: true, view: window };
-    el.dispatchEvent(new MouseEvent("mousedown", mo));
-    el.dispatchEvent(new MouseEvent("mouseup", mo));
-    el.click(); // real click → default action (navigation / submit) + handlers
-    return {
-      ok: true,
-      tag: el.tagName.toLowerCase(),
-      text: (el.innerText || (el as HTMLInputElement).value || el.getAttribute("aria-label") || "").slice(0, 120),
-    };
-  }
-
-  if (tool === "type_text") {
-    const selector = String(args.selector ?? "");
-    const text = String(args.text ?? "");
-    const replace = args.replace === true;
-    const submit = args.submit === true;
-    const el = one(selector);
-    if (!el) return { ok: false, error: "no element for selector", selector };
-    el.scrollIntoView({ block: "center" });
-    try {
-      el.focus({ preventScroll: true });
-    } catch {
-      /* ignore */
-    }
-    const tag = el.tagName.toLowerCase();
-    if (tag === "input" || tag === "textarea") {
-      const input = el as HTMLInputElement | HTMLTextAreaElement;
-      const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      // Use the native setter so React's onChange sees the value (a plain
-      // `.value =` is swallowed by React's controlled-input tracker).
-      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-      const next = replace ? text : (input.value ?? "") + text;
-      if (setter) setter.call(input, next);
-      else input.value = next;
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-    } else if (el.isContentEditable) {
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(el);
-      if (replace) {
-        // Select everything, then delete it, so the field starts empty.
-        sel?.removeAllRanges();
-        sel?.addRange(range);
-        document.execCommand("delete");
-      } else {
-        // Caret to the end so we append.
-        range.collapse(false);
-        sel?.removeAllRanges();
-        sel?.addRange(range);
-      }
-      // execCommand("insertText") drives the browser's editing pipeline, which
-      // rich editors (ProseMirror/Slate/Lexical/Draft) listen to via beforeinput.
-      const ok = document.execCommand("insertText", false, text);
-      if (!ok) {
-        el.dispatchEvent(
-          new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: text }),
-        );
-        el.textContent = (replace ? "" : el.textContent ?? "") + text;
-        el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
-      }
-    } else {
-      return { ok: false, error: `<${tag}> is not typeable (need input/textarea/contenteditable)` };
-    }
-    if (submit) {
-      const kev = (t: string) =>
-        new KeyboardEvent(t, {
-          bubbles: true,
-          cancelable: true,
-          key: "Enter",
-          code: "Enter",
-          keyCode: 13,
-          which: 13,
-        } as KeyboardEventInit);
-      el.dispatchEvent(kev("keydown"));
-      el.dispatchEvent(kev("keypress"));
-      el.dispatchEvent(kev("keyup"));
-      const form = el.closest("form");
-      if (form) {
-        try {
-          (form as HTMLFormElement).requestSubmit();
-        } catch {
-          /* no submit button / not submittable */
-        }
-      }
-    }
-    const value = (el as HTMLInputElement).value ?? el.textContent ?? "";
-    return { ok: true, tag, submitted: submit, value: String(value).slice(0, 200) };
-  }
-
-  if (tool === "press_key") {
-    const selector = args.selector ? String(args.selector) : "";
-    const key = String(args.key ?? "");
-    if (!key) return { ok: false, error: "key required" };
-    const target = (selector ? one(selector) : (document.activeElement as HTMLElement) || document.body) as HTMLElement | null;
-    if (!target) return { ok: false, error: "no target element", selector };
-    const CODES: Record<string, number> = {
-      Enter: 13,
-      Escape: 27,
-      Tab: 9,
-      Backspace: 8,
-      Delete: 46,
-      ArrowUp: 38,
-      ArrowDown: 40,
-      ArrowLeft: 37,
-      ArrowRight: 39,
-      Space: 32,
-    };
-    const k = key === "Space" ? " " : key;
-    const code = k.length === 1 ? (/[a-z]/i.test(k) ? "Key" + k.toUpperCase() : "Digit" + k) : key;
-    const kc = CODES[key] ?? (k.length === 1 ? k.toUpperCase().charCodeAt(0) : 0);
-    const mk = (t: string) =>
-      new KeyboardEvent(t, { bubbles: true, cancelable: true, key: k, code, keyCode: kc, which: kc } as KeyboardEventInit);
-    try {
-      target.focus({ preventScroll: true });
-    } catch {
-      /* ignore */
-    }
-    target.dispatchEvent(mk("keydown"));
-    target.dispatchEvent(mk("keypress"));
-    target.dispatchEvent(mk("keyup"));
-    return { ok: true, key: k };
-  }
-
-  if (tool === "scroll_to") {
-    const selector = String(args.selector ?? "");
-    const el = one(selector);
-    if (!el) return { ok: false, error: "no element for selector", selector };
-    el.scrollIntoView({ block: "center", inline: "center" });
-    return { ok: true };
-  }
-
-  if (tool === "wait_for") {
-    const selector = String(args.selector ?? "");
-    const timeout = typeof args.timeoutMs === "number" ? Math.min(args.timeoutMs as number, 30000) : 5000;
-    const state = String(args.state ?? "present"); // present | visible | gone
-    const start = Date.now();
-    const hit = () => {
-      const el = one(selector);
-      if (state === "gone") return !el;
-      if (!el) return false;
-      if (state === "visible") {
-        const r = el.getBoundingClientRect();
-        const cs = getComputedStyle(el);
-        return r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none";
-      }
-      return true;
-    };
-    while (Date.now() - start < timeout) {
-      if (hit()) return { ok: true, waitedMs: Date.now() - start };
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    return { ok: false, error: `timeout after ${timeout}ms waiting for "${state}": ${selector}` };
-  }
-
-  return { error: "unknown tool: " + tool };
-}
-
-async function activeTabId(): Promise<number | undefined> {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tab?.id;
 }
 
 // True when the active tab is a Featurebase page.
@@ -455,27 +217,37 @@ export class Bridge {
   private folderId = 0;
   private pendingFolder = new Map<number, (r: FolderPickResult) => void>();
   private driveTabId: number | null = null; // tab currently showing the "AI driving" overlay
-  readonly capture: Capture;
+  // Mirror of the worker-owned capture state, pushed to us on every change.
+  private onCaptureStatusBound: ((m: unknown) => void) | null = null;
 
   constructor(
     private onEvent: (e: HostEvent) => void,
-    onCaptureStatus?: (s: CaptureStatus) => void,
+    private onCaptureStatus?: (s: CaptureStatus) => void,
     // Called when the CLI wants to run a tool that isn't auto-allowed (team-MCP
     // mode): the panel shows an allow/deny popup and we relay the answer back.
     private onPermission?: (ask: PermissionAsk) => Promise<PermissionDecision>,
-  ) {
-    this.capture = new Capture(onCaptureStatus);
-  }
+  ) {}
 
   connect() {
-    const port = chrome.runtime.connectNative(HOST_NAME);
+    let port: chrome.runtime.Port;
+    try {
+      port = chrome.runtime.connectNative(HOST_NAME);
+    } catch (e) {
+      // e.g. "Extension context invalidated": the extension was reloaded under this page.
+      this.port = null;
+      this.onEvent({ type: "disconnected", error: e instanceof Error ? e.message : String(e) });
+      return;
+    }
     port.onMessage.addListener((m) => this.handle(m));
     port.onDisconnect.addListener(() => {
       const err = chrome.runtime.lastError;
+      // A port we already replaced (post() reconnected) is old news.
+      if (this.port !== port) return;
       this.port = null;
       this.onEvent({ type: "disconnected", error: err?.message });
     });
     this.port = port;
+    this.watchCaptureStatus();
   }
 
   private ensure(): chrome.runtime.Port | null {
@@ -483,14 +255,95 @@ export class Bridge {
     return this.port;
   }
 
+  // Send to the host. When the host has just exited, Chrome throws "Attempting to
+  // use a disconnected port object" before onDisconnect clears the port; we drop
+  // the dead port and retry once on a fresh one instead of throwing into React.
+  private post(msg: object): boolean {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const port = this.ensure();
+      if (!port) return false;
+      try {
+        port.postMessage(msg);
+        return true;
+      } catch {
+        if (this.port === port) this.port = null;
+      }
+    }
+    return false;
+  }
+
+  // For replies on the current port only (tool results, cancel): a dead port
+  // means the turn is gone, so there is nobody to reconnect for.
+  private reply(msg: object) {
+    try {
+      this.port?.postMessage(msg);
+    } catch {
+      this.port = null;
+    }
+  }
+
+  // Closing the panel does NOT stop the capture: the worker owns it and an
+  // external CLI may still be reading the buffer. The user's off switches are the
+  // settings toggle and Chrome's own "being debugged" banner.
   disconnect() {
     this.port?.disconnect();
     this.port = null;
-    void this.capture.disable();
+    if (this.onCaptureStatusBound) {
+      chrome.runtime.onMessage.removeListener(this.onCaptureStatusBound);
+      this.onCaptureStatusBound = null;
+    }
+  }
+
+  // ---- capture (owned by the background worker) ----------------------------
+
+  // Subscribe to the worker's capture status and ask for the current value, so a
+  // freshly opened panel shows "● capturing tab N" straight away.
+  private watchCaptureStatus() {
+    if (!this.onCaptureStatus || this.onCaptureStatusBound) return;
+    const cb = (m: unknown) => {
+      const msg = m as { type?: string; status?: CaptureStatus } | null;
+      if (msg?.type === "nx_capture_status" && msg.status) this.onCaptureStatus?.(msg.status);
+    };
+    this.onCaptureStatusBound = cb;
+    chrome.runtime.onMessage.addListener(cb);
+    try {
+      chrome.runtime.sendMessage({ type: "nx_capture_status" }, (resp?: { status?: CaptureStatus }) => {
+        void chrome.runtime.lastError; // worker still waking up — the next push covers us
+        if (resp?.status) this.onCaptureStatus?.(resp.status);
+      });
+    } catch {
+      /* extension reloaded under this page */
+    }
+  }
+
+  // The "Allow console & network capture" permission was revoked → tell the
+  // worker to detach now (that's what clears Chrome's banner).
+  setCaptureEnabled(enabled: boolean) {
+    try {
+      chrome.runtime.sendMessage({ type: "nx_capture_enabled", enabled }, () => void chrome.runtime.lastError);
+    } catch {
+      /* extension reloaded under this page */
+    }
+  }
+
+  // Read one debug tool out of the worker's CDP buffer.
+  private readCapture(tool: string, args: Record<string, unknown>): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(
+        { type: "nx_capture_read", tool, args },
+        (resp: { ok?: boolean; data?: unknown; error?: string } | undefined) => {
+          const lastErr = chrome.runtime.lastError;
+          if (lastErr || !resp) {
+            reject(new Error(`"${tool}" needs the extension's background worker (${lastErr?.message ?? "no reply"})`));
+          } else if (resp.ok) resolve(resp.data);
+          else reject(new Error(resp.error || `"${tool}" failed`));
+        },
+      );
+    });
   }
 
   send(req: { id: number; prompt: string } & SessionCfg) {
-    this.ensure()?.postMessage(req);
+    this.post(req);
   }
 
   // The tab the user is looking at RIGHT NOW (url + title). Seeded into each turn
@@ -505,16 +358,16 @@ export class Bridge {
   // Ask the host to spin up an idle CLI session now, so the next send() only
   // waits on the API instead of paying cold-start after the click.
   prewarm(cfg: SessionCfg) {
-    this.ensure()?.postMessage({ type: "prewarm", ...cfg });
+    this.post({ type: "prewarm", ...cfg });
   }
 
   // End the current conversation and prewarm a fresh session for the next one.
   reset(cfg: SessionCfg) {
-    this.ensure()?.postMessage({ type: "reset", ...cfg });
+    this.post({ type: "reset", ...cfg });
   }
 
   cancel(id: number) {
-    this.port?.postMessage({ type: "cancel", id });
+    this.reply({ type: "cancel", id });
   }
 
   // Request the merchant summary for a shop domain (request/response; resolves
@@ -523,7 +376,11 @@ export class Bridge {
     const id = ++this.summaryId;
     return new Promise((resolve) => {
       this.pendingSummary.set(id, resolve);
-      this.ensure()?.postMessage({ type: "shop_summary", id, domain, apiUrl, accessKey });
+      if (!this.post({ type: "shop_summary", id, domain, apiUrl, accessKey })) {
+        this.pendingSummary.delete(id);
+        resolve({ data: null, error: "native host not reachable" });
+        return;
+      }
       setTimeout(() => {
         if (this.pendingSummary.delete(id)) resolve({ data: null, error: "timed out" });
       }, 20000);
@@ -537,13 +394,11 @@ export class Bridge {
     const id = ++this.folderId;
     return new Promise((resolve) => {
       this.pendingFolder.set(id, resolve);
-      const port = this.ensure();
-      if (!port) {
+      if (!this.post({ type: "pick_folder", id })) {
         this.pendingFolder.delete(id);
         resolve({ path: "", error: "host not connected" });
         return;
       }
-      port.postMessage({ type: "pick_folder", id });
       // The dialog is modal on the user's side; give it room but don't hang forever.
       setTimeout(() => {
         if (this.pendingFolder.delete(id)) resolve({ path: "", error: "timed out" });
@@ -576,8 +431,10 @@ export class Bridge {
     }
   }
 
-  // The CLI asked (via the host) to run a browser tool. Debug tools read the CDP
-  // capture buffer; everything else runs in the active tab.
+  // The CLI asked (via the host) to run a browser tool. permission_request is
+  // host-session-only; everything else routes through execTool (shared with the
+  // background worker's delegate path). Only the host path shows the "AI is
+  // driving" overlay — it clears it on turn-end, which the delegate path lacks.
   private async runTool(req: ToolRequest) {
     try {
       let data: unknown;
@@ -587,36 +444,12 @@ export class Bridge {
         data = this.onPermission
           ? await this.onPermission({ toolName: a.tool_name ?? "", input: a.input ?? {}, toolUseId: a.tool_use_id })
           : ({ behavior: "deny", message: "No approver available" } as PermissionDecision);
-      } else if (DEBUG_TOOLS.has(req.tool)) {
-        // Capture is "AI decides": the CDP debugger attaches lazily the first
-        // time the assistant actually reads the buffer (that's when Chrome's
-        // "being debugged" banner appears), not eagerly from a settings toggle.
-        if (!this.capture.enabled) await this.capture.enable();
-        const a = (req.args ?? {}) as Record<string, unknown>;
-        if (req.tool === "get_console_logs") data = this.capture.getConsoleLogs(a);
-        else if (req.tool === "get_network_requests") data = this.capture.getNetworkRequests(a);
-        else data = await this.capture.getNetworkRequest(String(a.id ?? ""));
-      } else if (TAB_TOOLS.has(req.tool)) {
-        data = await runTabTool(req.tool, (req.args ?? {}) as Record<string, unknown>);
-      } else if (req.tool === "screenshot") {
-        data = await this.screenshot((req.args ?? {}) as Record<string, unknown>);
       } else {
-        const tabId = await activeTabId();
-        if (!tabId) throw new Error("no active tab");
-        // Show the "AI is driving" overlay only for tools that actually change
-        // the page — reads (get_page/query_dom/wait_for) shouldn't lock the user
-        // out or pay an extra injection.
-        if (Bridge.DRIVE_TOOLS.has(req.tool)) await this.startDrive(tabId, req);
-        const [res] = await chrome.scripting.executeScript({
-          target: { tabId },
-          func: domTool,
-          args: [req.tool, req.args ?? {}, FB_CONVO_SELECTOR],
-        });
-        data = res?.result;
+        data = await this.execTool(req.tool, (req.args ?? {}) as Record<string, unknown>, { drive: true });
       }
-      this.port?.postMessage({ type: "tool_result", callId: req.callId, ok: true, data });
+      this.reply({ type: "tool_result", callId: req.callId, ok: true, data });
     } catch (e) {
-      this.port?.postMessage({
+      this.reply({
         type: "tool_result",
         callId: req.callId,
         ok: false,
@@ -625,22 +458,49 @@ export class Bridge {
     }
   }
 
+  // Run ONE browser tool against the live tab (or CDP capture buffer) and RETURN
+  // its result (throws on failure). Called from runTool — the host-port path: the
+  // in-panel chat CLI, or an external CLI whose host happens to own the public
+  // bridge socket. { drive: true } adds the cursor overlay on page-changing tools.
+  //
+  // Everything here runs from shared modules the background worker also uses, so
+  // the same call works with the panel closed; only the debug tools are delegated
+  // (the worker is the single owner of the CDP debugger).
+  // permission_request is intentionally NOT handled here (host-session-only).
+  async execTool(
+    tool: string,
+    args: Record<string, unknown>,
+    opts?: { drive?: boolean },
+  ): Promise<unknown> {
+    if (DEBUG_TOOLS.has(tool)) return await this.readCapture(tool, args);
+    if (TAB_TOOLS.has(tool)) return await runTabTool(tool, args);
+    if (tool === "screenshot") return await this.screenshot(args);
+    if (!PAGE_TOOLS.has(tool)) throw new Error("unknown tool: " + tool);
+
+    const tabId = (await activeTab())?.id;
+    if (tabId == null) throw new Error("no active tab");
+    // Show the "AI is driving" overlay only for tools that actually change the
+    // page, and only on the host path (opts.drive) — reads shouldn't lock the
+    // user out, and a path with no turn-end can't clear the overlay.
+    if (opts?.drive && Bridge.DRIVE_TOOLS.has(tool)) await this.startDrive(tabId, tool, args);
+    return await runPageToolOn(tabId, tool, args);
+  }
+
   // Page-changing tools: these light up the "AI is driving" overlay and fly the
   // virtual cursor to their target. Pure reads are intentionally excluded.
   private static DRIVE_TOOLS = new Set(["click", "type_text", "scroll_to", "press_key"]);
 
   // Turn on the "AI is driving" overlay for this tab and move the cursor onto
   // the target element so the user sees where the action lands.
-  private async startDrive(tabId: number, req: ToolRequest) {
+  private async startDrive(tabId: number, tool: string, args: Record<string, unknown>) {
     this.driveTabId = tabId;
     await drive.on(tabId);
-    const a = (req.args ?? {}) as Record<string, unknown>;
-    const selector = typeof a.selector === "string" ? a.selector : undefined;
+    const selector = typeof args.selector === "string" ? args.selector : undefined;
     if (!selector) return;
     await drive.cursor(tabId, {
       selector,
-      nth: typeof a.nth === "number" ? a.nth : 0,
-      click: req.tool === "click",
+      nth: typeof args.nth === "number" ? args.nth : 0,
+      click: tool === "click",
     });
     await new Promise((r) => setTimeout(r, 320)); // let the cursor visibly travel
   }
@@ -652,28 +512,17 @@ export class Bridge {
     if (id != null) void drive.off(id);
   }
 
-  // Screenshot the visible area of the active tab and hand it back as image
-  // bytes (mcp-server turns this into an MCP image block). The driving overlay
-  // is hidden across the capture so the assistant never sees its own glow.
+  // Screenshot the visible area of the active tab (../pageTools does the capture).
+  // The driving overlay is hidden across the shot so the assistant never sees its
+  // own glow.
   private async screenshot(args: Record<string, unknown>): Promise<{ base64: string; mimeType: string }> {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.windowId == null) throw new Error("no active tab");
     const hideId = this.driveTabId;
     if (hideId != null) {
       await drive.hide(hideId);
       await new Promise((r) => setTimeout(r, 60)); // let the hide paint before capture
     }
     try {
-      const format = args.format === "png" ? "png" : "jpeg";
-      const quality = typeof args.quality === "number" ? args.quality : 80;
-      const opts =
-        format === "jpeg" ? ({ format: "jpeg", quality } as const) : ({ format: "png" } as const);
-      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, opts);
-      const comma = dataUrl.indexOf(",");
-      return {
-        mimeType: format === "png" ? "image/png" : "image/jpeg",
-        base64: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl,
-      };
+      return await screenshotTab(args);
     } finally {
       if (hideId != null) await drive.show(hideId);
     }
