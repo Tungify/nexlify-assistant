@@ -216,7 +216,53 @@ function leanPluginSettings() {
     /* no skills dir */
   }
   for (const id of LEAN_KEEP_PLUGINS) delete off[id];
-  return { enabledPlugins: off };
+  // Hide every skill but the support plugin's from the listing (it was ~17k
+  // characters of 35 skills, 3 of them relevant). Names come from the init line
+  // of an earlier session (`knownSkills`), so the first session after the host
+  // starts still lists them all. Plugin skills ignore overrides; the plugins are
+  // off anyway. Bundled skills go with disableBundledSkills.
+  const skillOverrides = {};
+  for (const name of knownSkills) if (!LEAN_KEEP_SKILL.test(name)) skillOverrides[name] = "off";
+  return {
+    enabledPlugins: off,
+    disableBundledSkills: true,
+    skillOverrides,
+    autoMemoryEnabled: false,
+    attribution: { commit: "", pr: "" },
+  };
+}
+const LEAN_KEEP_SKILL = /^customei:/;
+let knownSkills = []; // from the latest session's init line
+
+// The support skill, read from disk and appended to the system prompt: it then
+// sits in the cached prefix every session shares, instead of being re-written
+// into each session's first message (~7k tokens of cache writes per session).
+// "<plugin>:<skill>" resolves to ~/.claude/skills/<plugin>/skills/<skill>/SKILL.md
+// (a skills-dir plugin, how nexlify-skills installs). Not found → "" and the
+// panel's slash command loads it the usual way.
+function skillPrompt(id) {
+  const m = /^([a-z0-9-]+):([a-z0-9-]+)$/.exec(id || "");
+  if (!m) return "";
+  const dir = path.join(os.homedir(), ".claude", "skills", m[1], "skills", m[2]);
+  try {
+    const body = fs.readFileSync(path.join(dir, "SKILL.md"), "utf8").replace(/^---\n[\s\S]*?\n---\n/, "").trim();
+    return `\n\n# The ${m[2]} skill (already loaded; don't invoke it)\n\nBase directory for this skill: ${fs.realpathSync(dir)}\n\n${body}`;
+  } catch {
+    return "";
+  }
+}
+
+// A CLI session the panel wants back (a ticket it returned to), if its
+// transcript is still on disk. --resume restores the exact context, articles
+// read included, instead of replaying the chat as text.
+function resumable(id) {
+  if (!/^[0-9a-f-]{36}$/i.test(id || "")) return false;
+  try {
+    const root = path.join(os.homedir(), ".claude", "projects");
+    return fs.readdirSync(root).some((d) => fs.existsSync(path.join(root, d, id + ".jsonl")));
+  } catch {
+    return false;
+  }
 }
 // Built-in tools a support session needs: Read (the skill's references),
 // Skill, ToolSearch (deferred MCP tools); Bash only with shell on, Grep/Glob
@@ -304,6 +350,8 @@ function sessionCfg(msg) {
     systemPrompt: typeof msg.systemPrompt === "string" ? msg.systemPrompt.trim().slice(0, 12000) : "",
     // Lean: a narrow tool set and only the support skill's plugin (the Featurebase tab).
     lean: canTools && !!msg.lean,
+    skill: typeof msg.skill === "string" ? msg.skill : "", // "<plugin>:<skill>" to put in the system prompt
+    resume: typeof msg.resume === "string" && resumable(msg.resume) ? msg.resume : "",
   };
 }
 
@@ -312,7 +360,7 @@ const PROVIDERS = {
     cmd: process.env.CLAUDE_BIN || "claude",
     format: "claude-stream-json",
     supportsTools: true,
-    buildArgs({ page, tabs, capture, repoPath, model, effort, mcpTeam, mcpAllow, shell, systemPrompt, lean }) {
+    buildArgs({ page, tabs, capture, repoPath, model, effort, mcpTeam, mcpAllow, shell, systemPrompt, lean, skill, resume }) {
       const a = [
         "-p",
         "--input-format",
@@ -334,7 +382,9 @@ const PROVIDERS = {
       if (!mcpTeam) a.push("--strict-mcp-config");
       if (model) a.push("--model", model);
       if (effort) a.push("--effort", effort);
-      if (systemPrompt) a.push("--append-system-prompt", systemPrompt);
+      const fullPrompt = systemPrompt + skillPrompt(skill);
+      if (fullPrompt) a.push("--append-system-prompt", fullPrompt);
+      if (resume) a.push("--resume", resume);
       const bridgeTools = [];
       if (page) bridgeTools.push(...PAGE_TOOLS);
       if (tabs) bridgeTools.push(...TAB_TOOLS);
@@ -411,7 +461,7 @@ function emitStreamLine(id, line) {
 // effort, and whether the DOM tools (and thus MCP) are wired in.
 function cfgKey(msg) {
   const c = sessionCfg(msg);
-  return JSON.stringify({ cli: msg.cli, page: c.page, tabs: c.tabs, capture: c.capture, repoPath: c.repoPath, model: c.model, effort: c.effort, mcpTeam: c.mcpTeam, mcpAllow: c.mcpAllow, shell: c.shell, systemPrompt: c.systemPrompt, lean: c.lean });
+  return JSON.stringify({ cli: msg.cli, page: c.page, tabs: c.tabs, capture: c.capture, repoPath: c.repoPath, model: c.model, effort: c.effort, mcpTeam: c.mcpTeam, mcpAllow: c.mcpAllow, shell: c.shell, systemPrompt: c.systemPrompt, lean: c.lean, skill: c.skill, resume: c.resume });
 }
 
 // Spawn an idle stream-json session for this config. The user turn arrives
@@ -421,7 +471,9 @@ function spawnSession(msg) {
   const provider = PROVIDERS[msg.cli];
   const c = sessionCfg(msg);
   const argv = provider.buildArgs(c);
-  return spawn(provider.cmd, argv, { env: RUN_ENV, cwd: c.repoPath || os.tmpdir() });
+  // Lean: no ~/.claude/CLAUDE.md (repo routing rules the support tab never needs).
+  const env = c.lean ? { ...RUN_ENV, CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1" } : RUN_ENV;
+  return spawn(provider.cmd, argv, { env, cwd: c.repoPath || os.tmpdir() });
 }
 
 // Keep (at most) one prewarmed session matching the current settings.
@@ -465,6 +517,7 @@ function attachSession(s) {
     while ((nl = s.acc.indexOf("\n")) >= 0) {
       const line = s.acc.slice(0, nl);
       s.acc = s.acc.slice(nl + 1);
+      if (line.includes('"subtype":"init"') && line.includes('"type":"system"')) onInit(line);
       const res = emitStreamLine(s.currentId, line);
       if (!res) continue; // still streaming this turn
       if (s.currentId != null) {
@@ -492,6 +545,18 @@ function attachSession(s) {
   s.child.on("close", (code) => die("close", code));
 }
 
+// A session's init line: learn the skill names (for lean listings) and tell the
+// panel the CLI session id, so it can --resume this chat later.
+function onInit(line) {
+  try {
+    const o = JSON.parse(line);
+    if (Array.isArray(o.skills) && o.skills.length) knownSkills = o.skills.map(String);
+    if (o.session_id) send({ type: "cli_session", sessionId: String(o.session_id) });
+  } catch {
+    /* not JSON after all */
+  }
+}
+
 // Start a fresh conversation: retire any live session, then take the warm
 // child (if its config matches) or spawn one, and wire it up.
 function startSession(msg) {
@@ -511,7 +576,8 @@ function startSession(msg) {
     warm = null;
     child = spawnSession(msg); // may throw — caller handles
   }
-  session = { child, key, currentId: null, acc: "", errAcc: "", interrupted: false };
+  const c = sessionCfg(msg);
+  session = { child, key, currentId: null, acc: "", errAcc: "", interrupted: false, skillLoaded: skillPrompt(c.skill) ? c.skill : "" };
   attachSession(session);
   return session;
 }
@@ -536,7 +602,11 @@ function run(msg) {
   }
   session.currentId = msg.id;
   session.interrupted = false;
-  const turn = { type: "user", message: { role: "user", content: [{ type: "text", text: msg.prompt }] } };
+  let prompt = msg.prompt;
+  if (session.skillLoaded && prompt.startsWith("/" + session.skillLoaded)) {
+    prompt = prompt.slice(session.skillLoaded.length + 1).replace(/^\s+/, "");
+  }
+  const turn = { type: "user", message: { role: "user", content: [{ type: "text", text: prompt }] } };
   try {
     session.child.stdin.write(JSON.stringify(turn) + "\n");
   } catch (e) {
@@ -560,6 +630,7 @@ function reset(msg) {
     try { session.child.kill("SIGTERM"); } catch {}
   }
   session = null;
+  if (msg.resume) send({ type: "resume", sessionId: msg.resume, ok: !!sessionCfg(msg).resume });
   prewarm(msg);
 }
 

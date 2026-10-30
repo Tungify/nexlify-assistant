@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import {
   AppWindow,
   ArrowUp,
@@ -53,14 +53,16 @@ import {
   IN_FEATUREBASE,
   contextBlock,
   contextDelta,
+  seenOf,
   detectLanguage,
   insertIntoReply,
-  parseReply,
+  parseReplyCached,
   wasSent,
   subscribeFbContext,
   suggest,
   type FbContext,
   type FollowUpKind,
+  type Seen,
   type KnownFollowUp,
 } from "./support";
 import {
@@ -264,7 +266,11 @@ export default function App() {
   // The Featurebase conversation the chat on screen belongs to (names it in history).
   const convTicketRef = useRef<{ id: string; name: string } | null>(null);
   // What the session has seen of the conversation: later turns send only what's new.
-  const seenIdsRef = useRef<Set<string>>(new Set());
+  const seenRef = useRef<Seen>(new Map());
+  // The CLI session behind the chat on screen (kept with it, for --resume), and
+  // the one to resume on the next session start (a chat reopened from history).
+  const cliSessionRef = useRef("");
+  const resumeRef = useRef("");
   const seenStateRef = useRef("");
   const draftedRef = useRef<Set<string>>(
     new Set((() => {
@@ -291,6 +297,10 @@ export default function App() {
     // The Featurebase tab is a support copilot for the whole session.
     systemPrompt: IN_FEATUREBASE ? CS_SYSTEM : "",
     lean: IN_FEATUREBASE,
+    // The host puts the skill into the system prompt (cached across sessions) and
+    // drops the first turn's slash command; if it can't find it, the slash loads it.
+    skill: IN_FEATUREBASE ? CS_SKILL.slice(1) : "",
+    resume: resumeRef.current || undefined,
   });
 
   // Pop the OS folder picker (via the native host) and fill in the repo path.
@@ -317,6 +327,13 @@ export default function App() {
       updatedAt: Date.now(),
       messages: msgs.map((m) => ({ role: m.role, text: m.text })),
       ...(t ? { ticket: { ...t, ...(opts?.ended ? { ended: true } : {}) } } : {}),
+      ...(cliSessionRef.current ? { cliSession: cliSessionRef.current } : {}),
+      ...(seenRef.current.size
+        ? {
+            seen: [...seenRef.current].map(([id, v]) => [id, v.h, v.at, v.who] as [string, string, string, string]),
+            seenState: seenStateRef.current,
+          }
+        : {}),
     });
   };
 
@@ -399,6 +416,18 @@ export default function App() {
           flushStream();
           finish(e.code === 0 ? "done" : `exit ${e.code}`, e.code === 0 ? "success" : "critical");
           break;
+        case "cli_session":
+          cliSessionRef.current = e.sessionId;
+          break;
+        case "resume":
+          // Resumed: the CLI has the whole chat, no need to replay it as text.
+          if (e.ok && e.sessionId === resumeRef.current) replayPendingRef.current = false;
+          if (!e.ok && e.sessionId === resumeRef.current) {
+            resumeRef.current = "";
+            seenRef.current = new Map(); // replaying: the full conversation goes in again
+            seenStateRef.current = "";
+          }
+          break;
         case "disconnected":
           flushStream();
           appendToLast(
@@ -436,10 +465,9 @@ export default function App() {
   // Keep a prewarmed session matching the current settings so the first turn of
   // the next conversation only waits on the API, not cold-start.
   useEffect(() => {
-    bridgeRef.current?.prewarm({
-      cli, page: pageOn, tabs: tabsOn, capture: captureOn, repoPath: repoPath.trim(), model, effort,
-      mcpTeam, mcpAllow: mcpTeam ? mcpAllowText.split(/[\s,]+/).filter(Boolean) : [], shell: shellOn,
-    });
+    // The same config a turn sends (buildCfg), or the host's cfgKey never
+    // matches and the first turn starts cold.
+    bridgeRef.current?.prewarm(buildCfg());
   }, [cli, pageOn, tabsOn, captureOn, repoPath, model, effort, mcpTeam, mcpAllowText, shellOn]);
 
   // Capture is "AI decides": the CDP debugger attaches on-demand when the
@@ -774,8 +802,11 @@ export default function App() {
   // one is recognised in any language: no check-in right after a wrap-up.
   const known: KnownFollowUp[] = IN_FEATUREBASE
     ? messages.flatMap((m, i) => {
-        const kind = m.role === "assistant" && i > 0 ? FOLLOW_UP_ASKS[messages[i - 1].text] : undefined;
-        return kind && m.text ? [{ kind, text: parseReply(m.text)?.reply || m.text }] : [];
+        if (m.role !== "assistant" || !m.text) return [];
+        const reply = parseReplyCached(m.text)?.reply;
+        if (!reply) return [];
+        // Drafted by a follow-up button, or a real answer (never mistaken for one).
+        return [{ kind: (i > 0 && FOLLOW_UP_ASKS[messages[i - 1].text]) || "answer", text: reply }];
       })
     : [];
   const suggestion = IN_FEATUREBASE ? suggest(fbCtx, now, { checkinMin, closeMin, known }) : null;
@@ -852,9 +883,9 @@ export default function App() {
         prompt = `${CS_SKILL}\n\n${earlier}${block}\n\n${ask}`;
         replayPendingRef.current = false;
       } else {
-        prompt = `${contextDelta(cs, seenIdsRef.current, seenStateRef.current, Date.now(), custLang)}\n\n${ask}`;
+        prompt = `${contextDelta(cs, seenRef.current, seenStateRef.current, Date.now(), custLang)}\n\n${ask}`;
       }
-      seenIdsRef.current = new Set(cs.messages.map((m) => m.id));
+      seenRef.current = seenOf(cs);
       seenStateRef.current = cs.state;
       const shown = opts?.shown ?? (text || "(continue)");
       setMessages((ms) => [...ms, { role: "user", text: shown }, { role: "assistant", text: "" }]);
@@ -864,6 +895,7 @@ export default function App() {
       setRunning(true);
       setStatus({ label: "running…", tone: "info" });
       bridgeRef.current?.send({ id, prompt, ...buildCfg() });
+      resumeRef.current = "";
       return;
     }
 
@@ -902,6 +934,7 @@ export default function App() {
     setRunning(true);
     setStatus({ label: "running…", tone: "info" });
     bridgeRef.current?.send({ id, prompt, ...buildCfg() });
+    resumeRef.current = "";
   };
 
   const stop = () => {
@@ -915,12 +948,14 @@ export default function App() {
   const newChat = (opts?: { skipSave?: boolean }) => {
     if (!opts?.skipSave) saveCurrent(); // keep the one we're leaving
     convTicketRef.current = null;
+    cliSessionRef.current = "";
+    resumeRef.current = "";
     resetStream();
     bridgeRef.current?.reset(buildCfg());
     activeRef.current = null;
     convIdRef.current = null;
     replayPendingRef.current = false;
-    seenIdsRef.current = new Set();
+    seenRef.current = new Map();
     seenStateRef.current = "";
     setRunning(false);
     setMessages([]);
@@ -963,9 +998,13 @@ export default function App() {
     convIdRef.current = conv.id;
     convTicketRef.current = conv.ticket ? { id: conv.ticket.id, name: conv.ticket.name } : null;
     if (conv.ticket?.ended) unEnd(conv.ticket.id); // reopened to read or continue
+    // Continue its CLI session when it's still on disk (the host answers with a
+    // "resume" event); until then, and if not, the transcript is replayed as text.
     replayPendingRef.current = true;
-    seenIdsRef.current = new Set();
-    seenStateRef.current = "";
+    cliSessionRef.current = conv.cliSession ?? "";
+    resumeRef.current = conv.cliSession ?? "";
+    seenRef.current = new Map((conv.seen ?? []).map(([id, h, at, who]) => [id, { h, at, who }]));
+    seenStateRef.current = conv.seenState ?? "";
     bridgeRef.current?.reset(buildCfg());
     activeRef.current = null;
     setRunning(false);
@@ -1008,7 +1047,7 @@ export default function App() {
   // Support actions above the composer. The draft is the main one while the
   // customer is waiting; rewrites only make sense once there is a draft.
   const awaiting = suggestion?.kind === "awaiting";
-  const hasDraft = IN_FEATUREBASE && messages.some((m) => m.role === "assistant" && !!m.text && !!parseReply(m.text));
+  const hasDraft = IN_FEATUREBASE && messages.some((m) => m.role === "assistant" && !!m.text && !!parseReplyCached(m.text));
   const nudge =
     suggestion && suggestion.kind !== "awaiting" && !dismissed.has(suggestionKey)
       ? (suggestion as typeof suggestion & { kind: "checkin" | "close" })
@@ -1039,6 +1078,14 @@ export default function App() {
         ]
       : []),
   ];
+
+  // Stable handlers, so a streamed frame re-renders only the message it changes.
+  const insertRef = useRef(insertReply);
+  insertRef.current = insertReply;
+  const stableInsert = useCallback((text: string, html?: string) => insertRef.current(text, html), []);
+  const copyRef = useRef(copy);
+  copyRef.current = copy;
+  const stableCopy = useCallback((i: number, text: string) => void copyRef.current(i, text), []);
 
   const empty = messages.length === 0;
   const live = messages.length > 0;
@@ -1416,48 +1463,19 @@ export default function App() {
           </div>
         ) : (
           <div className="flex flex-col gap-4">
-            {messages.map((m, i) => {
-              if (m.role === "user") {
-                return (
-                  <div
-                    key={i}
-                    className="max-w-[85%] self-end whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-elevated px-3 py-1.5 text-[13px] leading-5"
-                  >
-                    {m.text}
-                  </div>
-                );
-              }
-              const streaming = running && i === messages.length - 1;
-              const parsed = IN_FEATUREBASE && m.text ? parseReply(m.text) : null;
-              return (
-                <div key={i} className="group min-w-0">
-                  {parsed ? (
-                    <ReplyCards
-                      r={parsed}
-                      streaming={streaming}
-                      sent={!streaming && wasSent(parsed.reply, fbCtx)}
-                      onInsert={insertReply}
-                    />
-                  ) : m.text ? (
-                    <AssistantText text={m.text} />
-                  ) : streaming ? (
-                    <p className="inline-flex items-center gap-1.5 text-xs text-muted">
-                      <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
-                      {IN_FEATUREBASE ? "Đang đọc hội thoại…" : "Working…"}
-                    </p>
-                  ) : null}
-                  {m.text && !parsed && !streaming && (
-                    <button
-                      onClick={() => copy(i, m.text)}
-                      className="-ml-1.5 mt-1 inline-flex h-6 items-center gap-1 rounded-md px-1.5 text-[11px] text-muted opacity-0 transition-opacity hover:bg-elevated hover:text-fg focus-visible:opacity-100 group-hover:opacity-100"
-                    >
-                      {copiedIdx === i ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
-                      {copiedIdx === i ? "Copied" : "Copy"}
-                    </button>
-                  )}
-                </div>
-              );
-            })}
+            {messages.map((m, i) => (
+              <MessageRow
+                key={i}
+                index={i}
+                role={m.role}
+                text={m.text}
+                streaming={running && i === messages.length - 1}
+                ctx={IN_FEATUREBASE ? fbCtx : null}
+                copied={copiedIdx === i}
+                onInsert={stableInsert}
+                onCopy={stableCopy}
+              />
+            ))}
           </div>
         )}
       </div>
@@ -1544,6 +1562,63 @@ export default function App() {
     </div>
   );
 }
+
+/* ------------------------------ a message -------------------------------- */
+
+// One chat message, memoized: while a reply streams only the last row changes,
+// so older replies (markdown, reply parsing, the sent check) don't re-render
+// every frame.
+const MessageRow = memo(function MessageRow({
+  index,
+  role,
+  text,
+  streaming,
+  ctx,
+  copied,
+  onInsert,
+  onCopy,
+}: {
+  index: number;
+  role: Role;
+  text: string;
+  streaming: boolean;
+  ctx: FbContext | null; // the open Featurebase conversation (support mode)
+  copied: boolean;
+  onInsert: (text: string, html?: string) => Promise<boolean>;
+  onCopy: (index: number, text: string) => void;
+}) {
+  if (role === "user") {
+    return (
+      <div className="max-w-[85%] self-end whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-elevated px-3 py-1.5 text-[13px] leading-5">
+        {text}
+      </div>
+    );
+  }
+  const parsed = IN_FEATUREBASE && text ? parseReplyCached(text) : null;
+  return (
+    <div className="group min-w-0">
+      {parsed ? (
+        <ReplyCards r={parsed} streaming={streaming} sent={!streaming && wasSent(parsed.reply, ctx)} onInsert={onInsert} />
+      ) : text ? (
+        <AssistantText text={text} />
+      ) : streaming ? (
+        <p className="inline-flex items-center gap-1.5 text-xs text-muted">
+          <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+          {IN_FEATUREBASE ? "Đang đọc hội thoại…" : "Working…"}
+        </p>
+      ) : null}
+      {text && !parsed && !streaming && (
+        <button
+          onClick={() => onCopy(index, text)}
+          className="-ml-1.5 mt-1 inline-flex h-6 items-center gap-1 rounded-md px-1.5 text-[11px] text-muted opacity-0 transition-opacity hover:bg-elevated hover:text-fg focus-visible:opacity-100 group-hover:opacity-100"
+        >
+          {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+          {copied ? "Copied" : "Copy"}
+        </button>
+      )}
+    </div>
+  );
+});
 
 /* ---------------------------- merchant card ------------------------------ */
 

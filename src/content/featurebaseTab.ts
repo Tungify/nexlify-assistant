@@ -400,9 +400,19 @@ function postToFrame(data: unknown) {
   if (frameReady()) frame!.contentWindow!.postMessage(data, EXT_ORIGIN);
 }
 
+// Ids and texts of the messages, hashed: an edited or deleted message changes it.
+function textHash(messages: CtxMessage[]): string {
+  let h = 5381;
+  for (const m of messages) {
+    const t = m.id + "\u0000" + m.text + "\u0001";
+    for (let i = 0; i < t.length; i++) h = ((h << 5) + h + t.charCodeAt(i)) | 0;
+  }
+  return `${messages.length}:${(h >>> 0).toString(36)}`;
+}
+
 function postContext(force = false) {
   const sig = ctx
-    ? `${ctx.conversationId}|${ctx.state}|${ctx.messages.length}|${ctx.messages.at(-1)?.id ?? ""}|${ctx.loading ? "L" : ""}|${open}`
+    ? `${ctx.conversationId}|${ctx.state}|${textHash(ctx.messages)}|${ctx.loading ? "L" : ""}|${open}`
     : `none|${open}`;
   if (!force && sig === ctxSig) return;
   ctxSig = sig;
@@ -419,13 +429,10 @@ async function refreshContext() {
       next = await fetchContext(id);
       if (next) cacheContext(next);
     } catch {
-      // A blip: keep what we had. A bare placeholder stays "loading" and retries.
-      const had = ctx?.conversationId === id ? ctx : null;
-      if (had && !had.fetchedAt) {
-        if (gen === ctxGen) refreshSoon(2000);
-        return;
-      }
-      next = had ? { ...had, loading: false } : null;
+      // A blip: keep what we had. A copy still loading (cached or a placeholder)
+      // stays "loading", so nobody drafts on stale data, and retries.
+      if (gen === ctxGen && ctx?.conversationId === id && ctx.loading) refreshSoon(2000);
+      return;
     }
   }
   if (gen !== ctxGen) return; // a newer refresh superseded this one
@@ -542,6 +549,7 @@ function setOpen(v: boolean) {
   }
   sync();
   postContext(); // tells the assistant whether it's on screen (auto-drafts only then)
+  if (v) void refreshContext(); // the poll paused while the tab was closed
 }
 
 function sync() {
@@ -591,5 +599,12 @@ setInterval(() => {
   if (open) schedule();
 }, 500);
 // State changes (closed, snoozed) and replies that don't re-render the thread.
-setInterval(() => void refreshContext(), CTX_POLL_MS);
+// Poll only while someone can see the chat: not with the Claude tab closed or
+// the browser tab in the background (that was ~180 requests an hour per tab).
+setInterval(() => {
+  if (open && !document.hidden) void refreshContext();
+}, CTX_POLL_MS);
+document.addEventListener("visibilitychange", () => {
+  if (open && !document.hidden) void refreshContext();
+});
 sync();

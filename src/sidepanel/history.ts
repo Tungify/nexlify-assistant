@@ -16,6 +16,11 @@ export interface Conversation {
   // Featurebase tab: the support conversation this chat belongs to. `ended` is
   // set when the agent closed the chat session after the conversation closed.
   ticket?: { id: string; name: string; ended?: boolean };
+  // The CLI session behind this chat, for --resume, and what it had seen of the
+  // Featurebase conversation (id, text hash, time, who) and its state.
+  cliSession?: string;
+  seen?: [string, string, string, string][];
+  seenState?: string;
 }
 
 const KEY = "conversations";

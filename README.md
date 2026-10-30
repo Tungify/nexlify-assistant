@@ -250,10 +250,12 @@ general chat:
   conversation from Featurebase's own dashboard API (same origin, your session,
   read-only): every message with its author and exact time, the customer, their
   shop domain, the state. A session's first turn gets the whole transcript;
-  later turns get only what changed (new messages, a state change), so the
+  later turns get only what changed (new, edited or deleted messages, a state
+  change), so the
   model never looks for the tab or reads the page and the transcript isn't
   piled up in its context again and again. Refreshed on a conversation switch, on a new message
-  in the thread, and every 20 s. On a switch the chat changes at once, from the
+  in the thread, and every 20 s while the Claude tab is open and the browser tab
+  visible. On a switch the chat changes at once, from the
   last 30 conversations' cached copy or a "Đang tải…" placeholder, and the fresh
   copy (one API call, ~0.3-0.7 s) follows; drafting waits for it.
 - **A support role for the whole session.** The tab's sessions start with
@@ -263,10 +265,24 @@ general chat:
   text quoted from the customer.
 - **Lean sessions.** The tab's `claude` gets only the built-in tools support
   needs (`--tools Read,Skill,ToolSearch`, plus Bash with shell on and Grep/Glob
-  with a repo) and only the `customei` plugin (`--settings` switches every other
-  enabled plugin off for that session; your own Claude Code is untouched). A
-  session starts with ~22k tokens of context instead of ~49k, and each reply is
-  ~1-2 s faster. See `leanTools` / `leanPluginSettings` in `native-host/host.js`.
+  with a repo), only the `customei` plugin, no other skills in its listing
+  (names learned from an earlier session's init line), no bundled skills, no
+  auto-memory, no `~/.claude/CLAUDE.md` and no commit attribution. All of it is
+  per session (`--settings`, env); your own Claude Code is untouched. See
+  `leanTools` / `leanPluginSettings` in `native-host/host.js`.
+- **The skill lives in the system prompt.** The host reads
+  `customei-support/SKILL.md` and appends it to `--append-system-prompt`, so it
+  is cached across sessions (a second session read all ~27k tokens of its
+  first call from cache), and drops the first turn's slash command. If the file
+  isn't found, the slash command loads it as before.
+- **Common questions need no Read.** The skill carries the 15 most-asked Help
+  Center articles (Quick answers). An answer written after a tool call isn't
+  streamed, so a draft used to show nothing for ~6 s; measured now: first text
+  0.8-1.2 s, done 6.8-8.1 s, no tool calls.
+- **Coming back to a ticket resumes its session** (`--resume`, the CLI session
+  id is kept with the chat), so the model still has what it read; a follow-up
+  took 3 s with first text at 0.7 s. If the session is gone, the chat is
+  replayed as text like before.
 - **The `customei-support` skill** (repo `nexlify-skills`) is loaded on the first
   turn by slash command, so it costs no extra round trip. It carries the
   product knowledge, the reply format and how to handle hard conversations
