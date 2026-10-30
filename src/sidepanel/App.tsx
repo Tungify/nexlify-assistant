@@ -503,6 +503,23 @@ export default function App() {
     shownCountRef.current = messages.length;
     if (el && stickRef.current) el.scrollTop = el.scrollHeight;
   }, [messages]);
+  // Content that grows after render (markdown, a reply card opening) or the
+  // iframe going from hidden to shown (no height while hidden) keeps the view at
+  // the end too, while following.
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const hasMessages = messages.length > 0;
+  useEffect(() => {
+    const list = listRef.current;
+    const content = contentRef.current;
+    if (!list || !content) return;
+    const follow = () => {
+      if (stickRef.current) list.scrollTop = list.scrollHeight;
+    };
+    const ro = new ResizeObserver(follow);
+    ro.observe(content);
+    ro.observe(list);
+    return () => ro.disconnect();
+  }, [hasMessages]);
 
   // The merchant/shop card needs BOTH the API URL and the admin access key set
   // in Settings — without them the lookup can't run, so the whole block stays
@@ -955,6 +972,7 @@ export default function App() {
     convTicketRef.current = null;
     cliSessionRef.current = "";
     resumeRef.current = "";
+    stickRef.current = true;
     resetStream();
     bridgeRef.current?.reset(buildCfg());
     activeRef.current = null;
@@ -1005,6 +1023,7 @@ export default function App() {
     if (conv.ticket?.ended) unEnd(conv.ticket.id); // reopened to read or continue
     // Continue its CLI session when it's still on disk (the host answers with a
     // "resume" event); until then, and if not, the transcript is replayed as text.
+    stickRef.current = true; // a chat opens at its latest message
     replayPendingRef.current = true;
     cliSessionRef.current = conv.cliSession ?? "";
     resumeRef.current = conv.cliSession ?? "";
@@ -1095,6 +1114,21 @@ export default function App() {
   // The conversation's latest message from a person, to spot out-of-date drafts
   // (null while it loads, so a cached copy doesn't flicker them).
   const latestHuman = IN_FEATUREBASE && fbCtx && !fbCtx.loading ? (lastHuman(fbCtx)?.id ?? "") : null;
+  // Drafts from before drafts remembered their basis: only the newest one, and
+  // only while the customer is still the last to have written, counts as current.
+  let lastDraft = -1;
+  for (let i = messages.length - 1; i >= 0 && IN_FEATUREBASE; i--) {
+    const m = messages[i];
+    if (m.role === "assistant" && m.text && parseReplyCached(m.text)) {
+      lastDraft = i;
+      break;
+    }
+  }
+  const customerLast = !!fbCtx && lastHuman(fbCtx)?.who === "customer";
+  const isStale = (m: Msg, i: number) =>
+    latestHuman !== null &&
+    m.role === "assistant" &&
+    (m.basis !== undefined ? m.basis !== latestHuman : i !== lastDraft || !customerLast);
 
   const empty = messages.length === 0;
   const live = messages.length > 0;
@@ -1471,7 +1505,7 @@ export default function App() {
             </p>
           </div>
         ) : (
-          <div className="flex flex-col gap-4">
+          <div ref={contentRef} className="flex flex-col gap-4">
             {messages.map((m, i) => (
               <MessageRow
                 key={i}
@@ -1479,7 +1513,7 @@ export default function App() {
                 role={m.role}
                 text={m.text}
                 streaming={running && i === messages.length - 1}
-                stale={latestHuman !== null && m.basis !== undefined && m.basis !== latestHuman}
+                stale={isStale(m, i)}
                 ctx={IN_FEATUREBASE ? fbCtx : null}
                 copied={copiedIdx === i}
                 onInsert={stableInsert}
