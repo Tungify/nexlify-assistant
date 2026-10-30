@@ -343,7 +343,10 @@ general chat:
   replaces its own earlier insert but keeps anything you typed. It never presses
   Send. Once an agent message in the conversation carries the draft (80% of its
   words, 90% for short ones, so small edits still count), the card turns grey,
-  says *Đã gửi*, and drops the insert button.
+  says *Đã gửi*, and drops the insert button. A draft written before the
+  conversation's latest message from a person (the customer wrote again, or the
+  agent answered something else) turns grey the same way, marked as out of
+  date: each draft remembers which message it was written after.
 - Every link opens in a new tab (a link followed inside the iframe would replace
   the chat with no way back).
 - Clicking *Details* / *Copilot* hands the sidebar back. The open/closed choice is
