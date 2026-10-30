@@ -53,6 +53,7 @@ import {
   IN_FEATUREBASE,
   contextBlock,
   contextDelta,
+  lastHuman,
   seenOf,
   detectLanguage,
   insertIntoReply,
@@ -113,6 +114,10 @@ type Role = "user" | "assistant";
 interface Msg {
   role: Role;
   text: string;
+  // A support draft: the last message a person (customer or agent) wrote in the
+  // Featurebase conversation when it was asked for. A newer one there means the
+  // draft is out of date. Bot replies and internal notes don't count.
+  basis?: string;
 }
 
 function cx(...c: (string | false | null | undefined)[]) {
@@ -325,7 +330,7 @@ export default function App() {
       id: convIdRef.current,
       title: t ? `${t.name} #${t.id}` : deriveTitle(msgs),
       updatedAt: Date.now(),
-      messages: msgs.map((m) => ({ role: m.role, text: m.text })),
+      messages: msgs.map((m) => ({ role: m.role, text: m.text, ...(m.basis !== undefined ? { basis: m.basis } : {}) })),
       ...(t ? { ticket: { ...t, ...(opts?.ended ? { ended: true } : {}) } } : {}),
       ...(cliSessionRef.current ? { cliSession: cliSessionRef.current } : {}),
       ...(seenRef.current.size
@@ -342,7 +347,7 @@ export default function App() {
     setMessages((ms) => {
       if (!ms.length || ms[ms.length - 1].role !== "assistant") return ms;
       const next = ms.slice();
-      next[next.length - 1] = { role: "assistant", text: next[next.length - 1].text + delta };
+      next[next.length - 1] = { ...next[next.length - 1], text: next[next.length - 1].text + delta };
       return next;
     });
 
@@ -888,7 +893,7 @@ export default function App() {
       seenRef.current = seenOf(cs);
       seenStateRef.current = cs.state;
       const shown = opts?.shown ?? (text || "(continue)");
-      setMessages((ms) => [...ms, { role: "user", text: shown }, { role: "assistant", text: "" }]);
+      setMessages((ms) => [...ms, { role: "user", text: shown }, { role: "assistant", text: "", basis: lastHuman(cs)?.id ?? "" }]);
       if (opts?.text === undefined) setInput("");
       const id = ++reqIdRef.current;
       activeRef.current = id;
@@ -992,7 +997,7 @@ export default function App() {
   const openConversation = (conv: Conversation) => {
     saveCurrent(); // save the current one before switching away
     resetStream();
-    const msgs: Msg[] = conv.messages.map((m) => ({ role: m.role, text: m.text }));
+    const msgs: Msg[] = conv.messages.map((m) => ({ role: m.role, text: m.text, basis: m.basis }));
     setMessages(msgs);
     messagesRef.current = msgs;
     convIdRef.current = conv.id;
@@ -1086,6 +1091,10 @@ export default function App() {
   const copyRef = useRef(copy);
   copyRef.current = copy;
   const stableCopy = useCallback((i: number, text: string) => void copyRef.current(i, text), []);
+
+  // The conversation's latest message from a person, to spot out-of-date drafts
+  // (null while it loads, so a cached copy doesn't flicker them).
+  const latestHuman = IN_FEATUREBASE && fbCtx && !fbCtx.loading ? (lastHuman(fbCtx)?.id ?? "") : null;
 
   const empty = messages.length === 0;
   const live = messages.length > 0;
@@ -1470,6 +1479,7 @@ export default function App() {
                 role={m.role}
                 text={m.text}
                 streaming={running && i === messages.length - 1}
+                stale={latestHuman !== null && m.basis !== undefined && m.basis !== latestHuman}
                 ctx={IN_FEATUREBASE ? fbCtx : null}
                 copied={copiedIdx === i}
                 onInsert={stableInsert}
@@ -1573,6 +1583,7 @@ const MessageRow = memo(function MessageRow({
   role,
   text,
   streaming,
+  stale,
   ctx,
   copied,
   onInsert,
@@ -1582,6 +1593,7 @@ const MessageRow = memo(function MessageRow({
   role: Role;
   text: string;
   streaming: boolean;
+  stale: boolean; // the conversation moved on since this draft was asked for
   ctx: FbContext | null; // the open Featurebase conversation (support mode)
   copied: boolean;
   onInsert: (text: string, html?: string) => Promise<boolean>;
@@ -1598,7 +1610,13 @@ const MessageRow = memo(function MessageRow({
   return (
     <div className="group min-w-0">
       {parsed ? (
-        <ReplyCards r={parsed} streaming={streaming} sent={!streaming && wasSent(parsed.reply, ctx)} onInsert={onInsert} />
+        <ReplyCards
+          r={parsed}
+          streaming={streaming}
+          sent={!streaming && wasSent(parsed.reply, ctx)}
+          stale={stale}
+          onInsert={onInsert}
+        />
       ) : text ? (
         <AssistantText text={text} />
       ) : streaming ? (

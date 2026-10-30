@@ -3,7 +3,7 @@
 // Vietnamese), the check-in / close nudge
 // and the action row above the composer. See support.ts for the logic.
 import { useRef, useState } from "react";
-import { Archive, Check, CheckCheck, ChevronRight, CircleCheck, ClipboardPaste, Copy, ExternalLink, Hourglass, LoaderCircle, MessageCircleQuestion, WandSparkles, X } from "lucide-react";
+import { Archive, Check, CheckCheck, History, ChevronRight, CircleCheck, ClipboardPaste, Copy, ExternalLink, Hourglass, LoaderCircle, MessageCircleQuestion, WandSparkles, X } from "lucide-react";
 import { Md } from "./Md";
 import {
   ASK_ITEMS,
@@ -428,13 +428,17 @@ export function ReplyCards({
   r,
   streaming,
   sent,
+  stale,
   onInsert,
 }: {
   r: ParsedReply;
   streaming: boolean;
   sent?: boolean; // the agent already sent this reply in the conversation
+  stale?: boolean; // written before the conversation's latest message: out of date
   onInsert: (text: string, html?: string) => Promise<boolean>;
 }) {
+  // Sent or out of date: shown for reference, grey, with no way to insert it.
+  const done = sent || stale;
   const [showAnalysis, setShowAnalysis] = useState(() => pref("fb_cs_analysis", false));
   const [showVi, setShowVi] = useState(() => pref("fb_cs_vi", true));
   // The reply as rendered (bold, lists, links), for a formatted insert/copy.
@@ -459,14 +463,14 @@ export function ReplyCards({
         </Disclosure>
       )}
       {r.reply && (
-        <section className={cx("rounded-xl border bg-surface", sent ? "border-border" : "border-accent/30")}>
-          <p className={cx("flex items-center gap-1.5 px-3 pt-2 text-[11px] font-medium", sent ? "text-muted" : "text-accent")}>
-            <span className={cx("rounded px-1 py-px font-semibold", sent ? "bg-elevated" : "bg-accent-soft")} title={r.lang}>
+        <section className={cx("rounded-xl border bg-surface", done ? "border-border" : "border-accent/30")}>
+          <p className={cx("flex items-center gap-1.5 px-3 pt-2 text-[11px] font-medium", done ? "text-muted" : "text-accent")}>
+            <span className={cx("rounded px-1 py-px font-semibold", done ? "bg-elevated" : "bg-accent-soft")} title={r.lang}>
               {langTag(r.lang)}
             </span>
-            {sent ? "Đã gửi cho khách" : "Gửi khách"}
+            {sent ? "Đã gửi cho khách" : stale ? "Bản cũ: hội thoại đã có tin mới hơn" : "Gửi khách"}
           </p>
-          <div ref={enRef} className="px-3 pb-1 pt-1">
+          <div ref={enRef} className={cx("px-3 pb-1 pt-1", stale && !sent && "text-muted")}>
             <Md text={r.reply} />
           </div>
           <div className="flex items-center gap-1 px-2 pb-2">
@@ -474,6 +478,11 @@ export function ReplyCards({
               <span className="inline-flex h-7 items-center gap-1.5 px-1.5 text-xs font-medium text-muted">
                 <CheckCheck className="h-3.5 w-3.5" />
                 Đã gửi
+              </span>
+            ) : stale ? (
+              <span className="inline-flex h-7 items-center gap-1.5 px-1.5 text-xs text-muted">
+                <History className="h-3.5 w-3.5" />
+                Soạn lại để trả lời tin mới
               </span>
             ) : (
               <ActionBtn

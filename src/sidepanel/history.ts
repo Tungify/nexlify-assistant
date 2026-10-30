@@ -6,6 +6,7 @@
 export interface StoredMsg {
   role: "user" | "assistant";
   text: string;
+  basis?: string; // support drafts: the Featurebase message it was written after
 }
 
 export interface Conversation {
